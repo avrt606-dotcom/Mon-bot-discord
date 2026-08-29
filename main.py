@@ -185,6 +185,93 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="help", description="Affiche la liste de toutes les commandes du bot")
+async def help_cmd(interaction: discord.Interaction):
+    couleur = get_premium_color(interaction.guild.id) if interaction.guild and is_premium(interaction.guild.id) else discord.Color.blurple()
+
+    embed = discord.Embed(
+        title="📖 Commandes du bot",
+        description="Voici toutes les commandes disponibles, classées par catégorie.",
+        color=couleur,
+        timestamp=datetime.datetime.now(),
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    embed.add_field(
+        name="🛠️ Général",
+        value=(
+            "`/ping` — Vérifie que le bot répond\n"
+            "`/help` — Affiche ce message\n"
+            "`/info` — Infos détaillées sur un membre\n"
+            "`/avatar` — Affiche l'avatar d'un membre\n"
+            "`/servericon` — Affiche l'icône du serveur\n"
+            "`/serverinfo` — Statistiques du serveur\n"
+            "`/sondage` — Crée un sondage avec réactions"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔨 Modération — Membres",
+        value=(
+            "`/mute` — Mute un membre pour une durée donnée\n"
+            "`/demute` — Retire le mute d'un membre\n"
+            "`/kick` — Expulse un membre\n"
+            "`/ban` — Bannit un membre\n"
+            "`/unban` — Débannit via un ID\n"
+            "`/warn` — Donne un avertissement\n"
+            "`/warnings` — Affiche les avertissements d'un membre\n"
+            "`/clearwarnings` — Efface les avertissements d'un membre\n"
+            "`/pseudo` — Change le pseudo d'un membre\n"
+            "`/role add` / `/role remove` — Gère les rôles d'un membre"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="💬 Modération — Salon",
+        value=(
+            "`/clear` — Supprime plusieurs messages\n"
+            "`/slowmode` — Configure le mode lent\n"
+            "`/lock` / `/unlock` — Verrouille/déverrouille le salon"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="✨ Premium",
+        value=(
+            "`/premium status` — Vérifie si le serveur est Premium\n"
+            "`/premium activer` — Active le Premium avec un code\n"
+            "`/premium couleur` — Personnalise la couleur des embeds"
+        ),
+        inline=False,
+    )
+
+    if await is_owner_level(interaction.user):
+        if await is_full_owner(interaction.user):
+            embed.add_field(
+                name="👑 Owner (propriétaire)",
+                value=(
+                    "`/premium generer` — Génère un code Premium\n"
+                    "`/owner add` — Ajoute un owner du bot\n"
+                    "`/owner remove` — Retire un owner du bot\n"
+                    "`/owner list` — Liste les owners du bot"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="👑 Statut Owner",
+                value="Tu es owner du bot : tu peux utiliser toutes les commandes de modération sur n'importe quel serveur où le bot est présent, sans avoir besoin des permissions Discord habituelles.",
+                inline=False,
+            )
+
+    embed.set_footer(text="Les commandes de modération nécessitent les permissions Discord correspondantes (ou d'être Owner du bot).")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="info", description="Affiche toutes les informations d'un membre")
 @app_commands.describe(utilisateur="La personne à consulter (toi par défaut)")
 async def info(interaction: discord.Interaction, utilisateur: discord.Member = None):
