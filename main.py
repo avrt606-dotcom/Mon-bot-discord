@@ -1,8 +1,13 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import datetime
+
+import database as db
+
+# Initialise la base SQLite (crée bot_data.db et ses tables si besoin)
+db.init_db()
 
 # Les "intents" définissent quelles infos le bot peut recevoir de Discord
 intents = discord.Intents.default()
@@ -13,17 +18,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"{bot.user} est connecté et en ligne !")
+    if not save_message_counts_task.is_running():
+        save_message_counts_task.start()
     try:
         synced = await bot.tree.sync()
         print(f"{len(synced)} commande(s) synchronisée(s).")
     except Exception as e:
         print(f"Erreur lors de la synchronisation des commandes : {e}")
 
-# Compteur de messages en mémoire : {user_id: nombre_de_messages}
-# Attention : Discord ne fournit pas d'historique global des messages via son API,
-# donc ce compteur ne comptabilise que les messages envoyés depuis le dernier
-# démarrage du bot (il repart à zéro à chaque redémarrage).
-message_count_store = {}
+# Compteur de messages : {user_id: nombre_de_messages}, chargé depuis la base SQLite
+# et sauvegardé automatiquement toutes les 5 minutes (voir save_message_counts_task).
+message_count_store = db.load_message_counts()
+
+
+@tasks.loop(minutes=5)
+async def save_message_counts_task():
+    db.save_message_counts(message_count_store)
 
 
 @bot.event
@@ -33,10 +43,36 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderateur: discord.Member = None, raison: str = None, extra_fields: list = None) -> discord.Embed:
-    """Embed uniforme utilisé par toutes les commandes de modération (mute, ban, kick, etc.)."""
+# --- Système Premium ---
+# premium_servers : {guild_id: {"activated_by": user_id, "activated_at": datetime, "code": str}}
+# premium_codes   : {code: {"generated_by", "assigned_to", "used", "used_by", "used_in_guild", "generated_at"}}
+# Chargés depuis la base SQLite au démarrage, et écrits dans la base à chaque changement.
+premium_servers = db.load_premium_servers()
+premium_codes = db.load_premium_codes()
+
+
+def is_premium(guild_id: int) -> bool:
+    return guild_id in premium_servers
+
+
+def generate_premium_code() -> str:
+    import random
+    import string
+    return "-".join(
+        "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        for _ in range(3)
+    )
+
+
+def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderateur: discord.Member = None, raison: str = None, extra_fields: list = None, guild: discord.Guild = None) -> discord.Embed:
+    """Embed uniforme utilisé par toutes les commandes de modération (mute, ban, kick, etc.).
+    Si le serveur est Premium, l'embed passe en doré avec un badge ✨."""
+    premium = guild is not None and is_premium(guild.id)
+    if premium:
+        color = discord.Color.gold()
+
     embed = discord.Embed(
-        title=f"{emoji} {title}",
+        title=f"{emoji} {title}" + (" ✨" if premium else ""),
         color=color,
         timestamp=datetime.datetime.now(),
     )
@@ -52,7 +88,10 @@ def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderat
     if raison is not None:
         embed.add_field(name="Raison", value=raison, inline=False)
 
-    embed.set_footer(text=f"ID : {cible.id}")
+    footer = f"ID : {cible.id}"
+    if premium:
+        footer = f"✨ Serveur Premium — {footer}"
+    embed.set_footer(text=footer)
     return embed
 
 
@@ -75,9 +114,9 @@ async def ping(interaction: discord.Interaction):
 async def info(interaction: discord.Interaction, utilisateur: discord.Member = None):
     utilisateur = utilisateur or interaction.user
 
-    couleur = utilisateur.color if utilisateur.color != discord.Color.default() else discord.Color.blurple()
+    couleur = discord.Color.gold() if is_premium(interaction.guild.id) else (utilisateur.color if utilisateur.color != discord.Color.default() else discord.Color.blurple())
     embed = discord.Embed(
-        title=f"Informations sur {utilisateur.display_name}",
+        title=f"Informations sur {utilisateur.display_name}" + (" ✨" if is_premium(interaction.guild.id) else ""),
         color=couleur,
         timestamp=datetime.datetime.now(),
     )
@@ -127,7 +166,10 @@ async def info(interaction: discord.Interaction, utilisateur: discord.Member = N
         inline=True,
     )
 
-    embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
+    footer_text = f"Demandé par {interaction.user}"
+    if is_premium(interaction.guild.id):
+        footer_text = f"✨ Serveur Premium — {footer_text}"
+    embed.set_footer(text=footer_text, icon_url=interaction.user.display_avatar.url)
 
     await interaction.response.send_message(embed=embed)
 
@@ -202,7 +244,24 @@ async def mute(interaction: discord.Interaction, utilisateur: discord.Member, du
         )
         return
 
-    import datetime
+    if utilisateur.is_timed_out():
+        embed = discord.Embed(
+            title="⛔ Déjà mute",
+            description=f"{utilisateur.mention} est déjà mute actuellement.",
+            color=discord.Color.red(),
+            timestamp=datetime.datetime.now(),
+        )
+        embed.set_thumbnail(url=utilisateur.display_avatar.url)
+        if utilisateur.timed_out_until:
+            embed.add_field(
+                name="Mute actif jusqu'à",
+                value=f"{discord.utils.format_dt(utilisateur.timed_out_until, style='F')}\n{discord.utils.format_dt(utilisateur.timed_out_until, style='R')}",
+                inline=False,
+            )
+        embed.set_footer(text=f"ID : {utilisateur.id} • Utilise /demute pour retirer le mute avant d'en appliquer un nouveau")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
     timeout_duration = datetime.timedelta(seconds=seconds)
 
     try:
@@ -220,6 +279,7 @@ async def mute(interaction: discord.Interaction, utilisateur: discord.Member, du
         "🔇", "Membre mute", discord.Color.orange(),
         utilisateur, interaction.user, raison,
         extra_fields=[("Durée", duree_lisible)],
+        guild=interaction.guild,
     )
     await interaction.response.send_message(embed=embed)
 
@@ -249,7 +309,7 @@ async def demute(interaction: discord.Interaction, utilisateur: discord.Member, 
         )
         return
 
-    embed = build_mod_embed("🔊", "Membre démute", discord.Color.green(), utilisateur, interaction.user, raison)
+    embed = build_mod_embed("🔊", "Membre démute", discord.Color.green(), utilisateur, interaction.user, raison, guild=interaction.guild)
     await interaction.response.send_message(embed=embed)
 
     try:
@@ -273,9 +333,9 @@ async def mute_demute_error(interaction: discord.Interaction, error):
         )
 
 
-# Stockage des warns en mémoire : {user_id: [ {moderator, reason, timestamp}, ... ]}
-# Attention : ces données sont perdues si le bot redémarre (pas de base de données).
-warnings_store = {}
+# Stockage des avertissements : {user_id: [ {id, moderator, reason, timestamp}, ... ]}
+# Chargé depuis la base SQLite au démarrage, et écrit dans la base à chaque changement.
+warnings_store = db.load_warnings()
 
 
 def build_warn_notification_embed(utilisateur: discord.Member, moderateur: discord.Member, raison: str, total: int) -> discord.Embed:
@@ -364,6 +424,7 @@ class WarningDeleteSelect(discord.ui.Select):
 
         removed = user_warnings.pop(index)
         warnings_store[self.utilisateur.id] = user_warnings
+        db.delete_warning(removed["id"])
 
         new_embed = build_warnings_embed(self.utilisateur, user_warnings)
         new_view = WarningDeleteView(self.utilisateur, user_warnings, self.author_id) if user_warnings else None
@@ -407,7 +468,7 @@ async def ban(interaction: discord.Interaction, utilisateur: discord.Member, rai
         )
         return
 
-    embed = build_mod_embed("🔨", "Membre banni", discord.Color.red(), utilisateur, interaction.user, raison)
+    embed = build_mod_embed("🔨", "Membre banni", discord.Color.red(), utilisateur, interaction.user, raison, guild=interaction.guild)
     await interaction.response.send_message(embed=embed)
 
 
@@ -443,7 +504,7 @@ async def unban(interaction: discord.Interaction, user_id: str, raison: str = "A
         )
         return
 
-    embed = build_mod_embed("♻️", "Membre débanni", discord.Color.green(), user, interaction.user, raison)
+    embed = build_mod_embed("♻️", "Membre débanni", discord.Color.green(), user, interaction.user, raison, guild=interaction.guild)
     await interaction.response.send_message(embed=embed)
 
 
@@ -470,7 +531,7 @@ async def kick(interaction: discord.Interaction, utilisateur: discord.Member, ra
         )
         return
 
-    embed = build_mod_embed("👢", "Membre expulsé", discord.Color.orange(), utilisateur, interaction.user, raison)
+    embed = build_mod_embed("👢", "Membre expulsé", discord.Color.orange(), utilisateur, interaction.user, raison, guild=interaction.guild)
     await interaction.response.send_message(embed=embed)
 
 
@@ -481,11 +542,15 @@ async def kick(interaction: discord.Interaction, utilisateur: discord.Member, ra
 )
 @app_commands.checks.has_permissions(moderate_members=True)
 async def warn(interaction: discord.Interaction, utilisateur: discord.Member, raison: str = "Aucune raison fournie"):
+    timestamp = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+    warning_id = db.add_warning(utilisateur.id, interaction.user.mention, raison, timestamp)
+
     user_warnings = warnings_store.setdefault(utilisateur.id, [])
     user_warnings.append({
+        "id": warning_id,
         "moderator": interaction.user.mention,
         "reason": raison,
-        "timestamp": datetime.datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "timestamp": timestamp,
     })
 
     embed = build_warn_notification_embed(utilisateur, interaction.user, raison, len(user_warnings))
@@ -516,7 +581,8 @@ async def warnings_cmd(interaction: discord.Interaction, utilisateur: discord.Me
 @app_commands.checks.has_permissions(moderate_members=True)
 async def clearwarnings(interaction: discord.Interaction, utilisateur: discord.Member):
     warnings_store[utilisateur.id] = []
-    embed = build_mod_embed("🧹", "Avertissements effacés", discord.Color.green(), utilisateur, interaction.user)
+    db.clear_warnings(utilisateur.id)
+    embed = build_mod_embed("🧹", "Avertissements effacés", discord.Color.green(), utilisateur, interaction.user, guild=interaction.guild)
     await interaction.response.send_message(embed=embed)
 
 
@@ -537,6 +603,149 @@ async def moderation_error(interaction: discord.Interaction, error):
             f"Une erreur est survenue : {error}",
             ephemeral=True,
         )
+
+# --- Commandes Premium ---
+premium_group = app_commands.Group(name="premium", description="Gestion du service Premium du bot")
+bot.tree.add_command(premium_group)
+
+
+@premium_group.command(name="generer", description="[Propriétaire uniquement] Génère un code Premium et l'envoie en MP")
+@app_commands.describe(utilisateur="La personne à qui envoyer le code Premium")
+async def premium_generer(interaction: discord.Interaction, utilisateur: discord.User):
+    if not await bot.is_owner(interaction.user):
+        embed = discord.Embed(
+            title="⛔ Accès refusé",
+            description="Seul le propriétaire du bot peut générer des codes Premium.",
+            color=discord.Color.red(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    code = generate_premium_code()
+    generated_at = datetime.datetime.now()
+    premium_codes[code] = {
+        "generated_by": interaction.user.id,
+        "assigned_to": utilisateur.id,
+        "used": False,
+        "used_by": None,
+        "used_in_guild": None,
+        "generated_at": generated_at,
+    }
+    db.add_premium_code(code, interaction.user.id, utilisateur.id, generated_at.isoformat())
+
+    dm_embed = discord.Embed(
+        title="✨ Ton code Premium",
+        description="Un code Premium vient de t'être offert ! Utilise `/premium activer` sur le serveur que tu veux booster pour l'activer.",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(),
+    )
+    dm_embed.add_field(name="Code", value=f"`{code}`", inline=False)
+    dm_embed.set_footer(text="Ce code est à usage unique, garde-le secret.")
+
+    try:
+        await utilisateur.send(embed=dm_embed)
+        envoye = True
+    except discord.Forbidden:
+        envoye = False
+
+    confirm_embed = discord.Embed(
+        title="✅ Code Premium généré",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(),
+    )
+    confirm_embed.set_thumbnail(url=utilisateur.display_avatar.url)
+    confirm_embed.add_field(name="Code", value=f"`{code}`", inline=False)
+    confirm_embed.add_field(name="Destinataire", value=utilisateur.mention, inline=True)
+    confirm_embed.add_field(name="Envoyé en MP", value="✅ Oui" if envoye else "❌ Non (MP fermés, transmets-le à la main)", inline=True)
+    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+
+
+@premium_group.command(name="activer", description="Active le Premium sur ce serveur avec un code reçu en MP")
+@app_commands.describe(code="Le code Premium que tu as reçu")
+async def premium_activer(interaction: discord.Interaction, code: str):
+    code = code.strip().upper()
+    data = premium_codes.get(code)
+
+    if is_premium(interaction.guild.id):
+        embed = discord.Embed(
+            title="✨ Déjà Premium",
+            description="Ce serveur profite déjà du Premium !",
+            color=discord.Color.gold(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if data is None or data["used"]:
+        embed = discord.Embed(
+            title="❌ Code invalide",
+            description="Ce code n'existe pas ou a déjà été utilisé.",
+            color=discord.Color.red(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    data["used"] = True
+    data["used_by"] = interaction.user.id
+    data["used_in_guild"] = interaction.guild.id
+    db.mark_premium_code_used(code, interaction.user.id, interaction.guild.id)
+
+    activated_at = datetime.datetime.now()
+    premium_servers[interaction.guild.id] = {
+        "activated_by": interaction.user.id,
+        "activated_at": activated_at,
+        "code": code,
+    }
+    db.add_premium_server(interaction.guild.id, interaction.user.id, activated_at.isoformat(), code)
+
+    embed = discord.Embed(
+        title="🎉 Serveur passé Premium !",
+        description=f"**{interaction.guild.name}** est maintenant Premium grâce à {interaction.user.mention} !",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.add_field(
+        name="✨ Bonus débloqués",
+        value=(
+            "• Embeds dorés sur toutes les commandes de modération\n"
+            "• Badge ✨ Premium sur `/info` et `/warnings`\n"
+            "• Support prioritaire"
+        ),
+        inline=False,
+    )
+    if interaction.guild.icon:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+    embed.set_footer(text=f"Activé par {interaction.user}")
+    await interaction.response.send_message(embed=embed)
+
+
+@premium_group.command(name="status", description="Vérifie si ce serveur profite du Premium")
+async def premium_status(interaction: discord.Interaction):
+    if is_premium(interaction.guild.id):
+        data = premium_servers[interaction.guild.id]
+        embed = discord.Embed(
+            title="✨ Serveur Premium",
+            description=f"**{interaction.guild.name}** profite du service Premium !",
+            color=discord.Color.gold(),
+            timestamp=datetime.datetime.now(),
+        )
+        activateur = interaction.guild.get_member(data["activated_by"])
+        embed.add_field(
+            name="Activé le",
+            value=f"{discord.utils.format_dt(data['activated_at'], style='F')}\n{discord.utils.format_dt(data['activated_at'], style='R')}",
+            inline=False,
+        )
+        embed.add_field(name="Activé par", value=activateur.mention if activateur else "Inconnu", inline=False)
+        if interaction.guild.icon:
+            embed.set_thumbnail(url=interaction.guild.icon.url)
+    else:
+        embed = discord.Embed(
+            title="Serveur non-Premium",
+            description="Ce serveur n'a pas encore le Premium.\nDemande un code au propriétaire du bot, puis utilise `/premium activer`.",
+            color=discord.Color.greyple(),
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 # Le token est lu depuis une variable d'environnement, jamais écrit ici en dur
 token = os.environ.get("DISCORD_TOKEN")
