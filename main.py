@@ -627,6 +627,73 @@ async def moderation_error(interaction: discord.Interaction, error):
             ephemeral=True,
         )
 
+# Couleurs prédéfinies proposées pour /premium couleur : (nom affiché, code hex, emoji)
+PRESET_COLORS = [
+    ("Rose", "FF69B4", "🩷"),
+    ("Rouge", "E74C3C", "🔴"),
+    ("Orange", "E67E22", "🟠"),
+    ("Jaune", "F1C40F", "🟡"),
+    ("Vert", "2ECC71", "🟢"),
+    ("Turquoise", "1ABC9C", "🔷"),
+    ("Bleu", "3498DB", "🔵"),
+    ("Violet", "9B59B6", "🟣"),
+    ("Marron", "8B4513", "🟤"),
+    ("Noir", "23272A", "⚫"),
+    ("Blanc", "FFFFFF", "⚪"),
+    ("Doré (défaut)", "FFD700", "🟨"),
+]
+
+
+class PremiumColorSelect(discord.ui.Select):
+    """Menu déroulant listant les couleurs prédéfinies pour /premium couleur."""
+
+    def __init__(self, guild_id: int, author_id: int):
+        self.guild_id = guild_id
+        self.author_id = author_id
+
+        options = [
+            discord.SelectOption(label=nom, value=hex_code, emoji=emoji, description=f"#{hex_code}")
+            for nom, hex_code, emoji in PRESET_COLORS
+        ]
+
+        super().__init__(
+            placeholder="🎨 Choisis une couleur prédéfinie...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Seule la personne qui a lancé la commande peut choisir la couleur.",
+                ephemeral=True,
+            )
+            return
+
+        hex_color = self.values[0]
+        premium_servers[self.guild_id]["color"] = hex_color
+        db.update_premium_color(self.guild_id, hex_color)
+
+        embed = discord.Embed(
+            title="🎨 Couleur mise à jour !",
+            description="Tous les embeds du bot sur ce serveur utiliseront désormais cette couleur.",
+            color=discord.Color(int(hex_color, 16)),
+            timestamp=datetime.datetime.now(),
+        )
+        embed.add_field(name="Nouvelle couleur", value=f"`#{hex_color}`", inline=True)
+        embed.set_footer(text=f"Changé par {interaction.user}")
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class PremiumColorView(discord.ui.View):
+    """Vue contenant le menu de sélection de couleur prédéfinie."""
+
+    def __init__(self, guild_id: int, author_id: int):
+        super().__init__(timeout=120)
+        self.add_item(PremiumColorSelect(guild_id, author_id))
+
+
 # --- Commandes Premium ---
 premium_group = app_commands.Group(name="premium", description="Gestion du service Premium du bot")
 bot.tree.add_command(premium_group)
@@ -744,9 +811,9 @@ async def premium_activer(interaction: discord.Interaction, code: str):
 
 
 @premium_group.command(name="couleur", description="[Premium] Choisis la couleur des embeds du bot sur ce serveur")
-@app_commands.describe(couleur="Un code couleur hexadécimal, ex: #FF5733, 5865F2, 00FF00")
+@app_commands.describe(couleur="Optionnel : code hex personnalisé (ex: #FF5733). Laisse vide pour choisir une couleur prédéfinie.")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def premium_couleur(interaction: discord.Interaction, couleur: str):
+async def premium_couleur(interaction: discord.Interaction, couleur: str = None):
     if not is_premium(interaction.guild.id):
         embed = discord.Embed(
             title="✨ Fonctionnalité Premium",
@@ -754,6 +821,24 @@ async def premium_couleur(interaction: discord.Interaction, couleur: str):
             color=discord.Color.greyple(),
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # Aucun code hex fourni : on propose le menu de couleurs prédéfinies
+    if couleur is None:
+        embed = discord.Embed(
+            title="🎨 Choisis une couleur",
+            description=(
+                "Sélectionne une couleur prédéfinie dans le menu ci-dessous 👇\n\n"
+                "Tu préfères une couleur précise ? Relance la commande avec "
+                "`/premium couleur couleur:#RRGGBB` pour un code hex personnalisé."
+            ),
+            color=get_premium_color(interaction.guild.id),
+        )
+        # Aperçu visuel des couleurs disponibles
+        apercu = "  ".join(f"{emoji} {nom}" for nom, _, emoji in PRESET_COLORS)
+        embed.add_field(name="Couleurs disponibles", value=apercu, inline=False)
+        view = PremiumColorView(interaction.guild.id, interaction.user.id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         return
 
     hex_color = parse_hex_color(couleur)
