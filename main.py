@@ -685,6 +685,324 @@ async def moderation_error(interaction: discord.Interaction, error):
             ephemeral=True,
         )
 
+
+def build_action_embed(emoji: str, title: str, color: discord.Color, description: str, guild: discord.Guild = None, extra_fields: list = None, owner_badge: bool = False) -> discord.Embed:
+    """Embed uniforme pour les actions qui ne ciblent pas un membre précis
+    (verrouillage de salon, mode lent, purge de messages, etc.)."""
+    premium = guild is not None and is_premium(guild.id)
+    if premium:
+        color = get_premium_color(guild.id)
+
+    embed = discord.Embed(
+        title=f"{emoji} {title}" + (" ✨" if premium else ""),
+        description=description,
+        color=color,
+        timestamp=datetime.datetime.now(),
+    )
+    if extra_fields:
+        for name, value in extra_fields:
+            embed.add_field(name=name, value=value, inline=True)
+
+    footer_parts = []
+    if premium:
+        footer_parts.append("✨ Serveur Premium")
+    if owner_badge:
+        footer_parts.append("👑 Action Owner")
+    if footer_parts:
+        embed.set_footer(text=" — ".join(footer_parts))
+    return embed
+
+
+# --- Commandes utilitaires ---
+
+@bot.tree.command(name="clear", description="Supprime plusieurs messages d'un coup dans le salon")
+@app_commands.describe(
+    nombre="Nombre de messages à supprimer (entre 1 et 100)",
+    utilisateur="Ne supprimer que les messages de cette personne (optionnel)",
+)
+@has_permissions_or_owner(manage_messages=True)
+async def clear(interaction: discord.Interaction, nombre: app_commands.Range[int, 1, 100], utilisateur: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+
+    def check(m: discord.Message) -> bool:
+        return utilisateur is None or m.author.id == utilisateur.id
+
+    deleted = await interaction.channel.purge(limit=nombre, check=check)
+
+    description = f"**{len(deleted)}** message(s) supprimé(s) dans {interaction.channel.mention}."
+    if utilisateur is not None:
+        description += f"\nFiltré sur les messages de {utilisateur.mention}."
+
+    embed = build_action_embed(
+        "🧹", "Messages supprimés", discord.Color.green(), description,
+        guild=interaction.guild, owner_badge=await is_owner_level(interaction.user),
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="slowmode", description="Configure le mode lent (slowmode) du salon")
+@app_commands.describe(secondes="Délai en secondes entre chaque message (0 pour désactiver, max 21600)")
+@has_permissions_or_owner(manage_channels=True)
+async def slowmode(interaction: discord.Interaction, secondes: app_commands.Range[int, 0, 21600]):
+    await interaction.channel.edit(slowmode_delay=secondes)
+
+    if secondes == 0:
+        description = f"Le mode lent a été **désactivé** dans {interaction.channel.mention}."
+    else:
+        description = f"Le mode lent est maintenant de **{format_duration(secondes)}** dans {interaction.channel.mention}."
+
+    embed = build_action_embed(
+        "🐌", "Mode lent mis à jour", discord.Color.blurple(), description,
+        guild=interaction.guild, owner_badge=await is_owner_level(interaction.user),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="lock", description="Verrouille le salon (empêche @everyone d'écrire)")
+@app_commands.describe(raison="La raison du verrouillage")
+@has_permissions_or_owner(manage_channels=True)
+async def lock(interaction: discord.Interaction, raison: str = "Aucune raison fournie"):
+    overwrite = interaction.channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = False
+    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=raison)
+
+    embed = build_action_embed(
+        "🔒", "Salon verrouillé", discord.Color.red(),
+        f"{interaction.channel.mention} a été verrouillé. Seuls les membres avec des permissions spécifiques peuvent encore écrire.",
+        guild=interaction.guild, extra_fields=[("Raison", raison)],
+        owner_badge=await is_owner_level(interaction.user),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="unlock", description="Déverrouille le salon")
+@app_commands.describe(raison="La raison du déverrouillage")
+@has_permissions_or_owner(manage_channels=True)
+async def unlock(interaction: discord.Interaction, raison: str = "Aucune raison fournie"):
+    overwrite = interaction.channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = None
+    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=raison)
+
+    embed = build_action_embed(
+        "🔓", "Salon déverrouillé", discord.Color.green(),
+        f"{interaction.channel.mention} a été déverrouillé.",
+        guild=interaction.guild, extra_fields=[("Raison", raison)],
+        owner_badge=await is_owner_level(interaction.user),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="pseudo", description="Change le pseudo d'un membre sur le serveur")
+@app_commands.describe(
+    utilisateur="Le membre concerné",
+    nouveau_pseudo="Le nouveau pseudo (laisse vide pour réinitialiser au nom d'origine)",
+)
+@has_permissions_or_owner(manage_nicknames=True)
+async def pseudo(interaction: discord.Interaction, utilisateur: discord.Member, nouveau_pseudo: str = None):
+    ancien_pseudo = utilisateur.display_name
+    try:
+        await utilisateur.edit(nick=nouveau_pseudo, reason=f"Changé par {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Je n'ai pas la permission de changer le pseudo de cette personne (vérifie mon rôle et sa position dans la hiérarchie).",
+            ephemeral=True,
+        )
+        return
+
+    embed = build_mod_embed(
+        "✏️", "Pseudo modifié", discord.Color.blurple(), utilisateur, interaction.user,
+        extra_fields=[("Avant", ancien_pseudo), ("Après", nouveau_pseudo or utilisateur.name)],
+        guild=interaction.guild, owner_badge=await is_owner_level(interaction.user),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@clear.error
+@slowmode.error
+@lock.error
+@unlock.error
+@pseudo.error
+async def utility_moderation_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "Tu n'as pas la permission d'utiliser cette commande.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"Une erreur est survenue : {error}",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="avatar", description="Affiche l'avatar d'un membre en grand")
+@app_commands.describe(utilisateur="La personne dont tu veux voir l'avatar (toi par défaut)")
+async def avatar(interaction: discord.Interaction, utilisateur: discord.Member = None):
+    utilisateur = utilisateur or interaction.user
+    couleur = get_premium_color(interaction.guild.id) if is_premium(interaction.guild.id) else discord.Color.blurple()
+
+    embed = discord.Embed(
+        title=f"🖼️ Avatar de {utilisateur.display_name}",
+        color=couleur,
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_image(url=utilisateur.display_avatar.url)
+    embed.set_footer(text=f"ID : {utilisateur.id}")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="servericon", description="Affiche l'icône du serveur en grand")
+async def servericon(interaction: discord.Interaction):
+    if interaction.guild.icon is None:
+        await interaction.response.send_message("Ce serveur n'a pas d'icône.", ephemeral=True)
+        return
+
+    couleur = get_premium_color(interaction.guild.id) if is_premium(interaction.guild.id) else discord.Color.blurple()
+    embed = discord.Embed(
+        title=f"🖼️ Icône de {interaction.guild.name}",
+        color=couleur,
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_image(url=interaction.guild.icon.url)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="serverinfo", description="Affiche les informations générales du serveur")
+async def serverinfo(interaction: discord.Interaction):
+    guild = interaction.guild
+    couleur = get_premium_color(guild.id) if is_premium(guild.id) else discord.Color.blurple()
+
+    embed = discord.Embed(
+        title=f"📊 Informations sur {guild.name}" + (" ✨" if is_premium(guild.id) else ""),
+        color=couleur,
+        timestamp=datetime.datetime.now(),
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    embed.add_field(name="🆔 ID", value=str(guild.id), inline=True)
+    embed.add_field(name="👑 Propriétaire", value=guild.owner.mention if guild.owner else "Inconnu", inline=True)
+    embed.add_field(name="📅 Créé le", value=discord.utils.format_dt(guild.created_at, style="D"), inline=True)
+    embed.add_field(name="👥 Membres", value=str(guild.member_count), inline=True)
+    embed.add_field(name="💬 Salons textuels", value=str(len(guild.text_channels)), inline=True)
+    embed.add_field(name="🔊 Salons vocaux", value=str(len(guild.voice_channels)), inline=True)
+    embed.add_field(name="🎭 Rôles", value=str(len(guild.roles)), inline=True)
+    embed.add_field(name="😀 Emojis", value=str(len(guild.emojis)), inline=True)
+    embed.add_field(
+        name="💎 Niveau de boost",
+        value=f"Niveau {guild.premium_tier} ({guild.premium_subscription_count} boost(s))",
+        inline=True,
+    )
+    if is_premium(guild.id):
+        embed.add_field(name="✨ Premium du bot", value="Actif — utilise `/premium status` pour les détails", inline=False)
+
+    embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+
+# --- Gestion des rôles ---
+role_group = app_commands.Group(name="role", description="Gestion des rôles des membres")
+bot.tree.add_command(role_group)
+
+
+@role_group.command(name="add", description="Ajoute un rôle à un membre")
+@app_commands.describe(utilisateur="Le membre concerné", role="Le rôle à ajouter")
+@has_permissions_or_owner(manage_roles=True)
+async def role_add(interaction: discord.Interaction, utilisateur: discord.Member, role: discord.Role):
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "Je ne peux pas gérer ce rôle : il est plus haut que mon propre rôle dans la hiérarchie.",
+            ephemeral=True,
+        )
+        return
+    if role in utilisateur.roles:
+        await interaction.response.send_message(f"{utilisateur.mention} a déjà le rôle {role.mention}.", ephemeral=True)
+        return
+
+    await utilisateur.add_roles(role, reason=f"Ajouté par {interaction.user}")
+    embed = build_mod_embed(
+        "➕", "Rôle ajouté", discord.Color.green(), utilisateur, interaction.user,
+        extra_fields=[("Rôle", role.mention)], guild=interaction.guild,
+        owner_badge=await is_owner_level(interaction.user),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@role_group.command(name="remove", description="Retire un rôle à un membre")
+@app_commands.describe(utilisateur="Le membre concerné", role="Le rôle à retirer")
+@has_permissions_or_owner(manage_roles=True)
+async def role_remove(interaction: discord.Interaction, utilisateur: discord.Member, role: discord.Role):
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "Je ne peux pas gérer ce rôle : il est plus haut que mon propre rôle dans la hiérarchie.",
+            ephemeral=True,
+        )
+        return
+    if role not in utilisateur.roles:
+        await interaction.response.send_message(f"{utilisateur.mention} n'a pas le rôle {role.mention}.", ephemeral=True)
+        return
+
+    await utilisateur.remove_roles(role, reason=f"Retiré par {interaction.user}")
+    embed = build_mod_embed(
+        "➖", "Rôle retiré", discord.Color.orange(), utilisateur, interaction.user,
+        extra_fields=[("Rôle", role.mention)], guild=interaction.guild,
+        owner_badge=await is_owner_level(interaction.user),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@role_add.error
+@role_remove.error
+async def role_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "Tu n'as pas la permission d'utiliser cette commande.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"Une erreur est survenue : {error}",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="sondage", description="Crée un sondage rapide avec réactions")
+@app_commands.describe(
+    question="La question du sondage",
+    options="Les choix séparés par des virgules (max 9). Laisse vide pour un simple 👍 / 👎",
+)
+async def sondage(interaction: discord.Interaction, question: str, options: str = None):
+    numeros = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+    couleur = get_premium_color(interaction.guild.id) if is_premium(interaction.guild.id) else discord.Color.blurple()
+
+    embed = discord.Embed(
+        title="📊 Sondage",
+        description=f"**{question}**",
+        color=couleur,
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_footer(text=f"Sondage lancé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
+
+    if options:
+        choix = [c.strip() for c in options.split(",") if c.strip()][:9]
+        if len(choix) < 2:
+            await interaction.response.send_message(
+                "Donne au moins 2 choix séparés par des virgules, ex : `Pizza, Sushi, Burger`.",
+                ephemeral=True,
+            )
+            return
+        texte = "\n".join(f"{numeros[i]} {c}" for i, c in enumerate(choix))
+        embed.add_field(name="Choix", value=texte, inline=False)
+        emojis = numeros[:len(choix)]
+    else:
+        emojis = ["👍", "👎"]
+
+    await interaction.response.send_message(embed=embed)
+    message = await interaction.original_response()
+    for e in emojis:
+        await message.add_reaction(e)
+
+
 # Couleurs prédéfinies proposées pour /premium couleur : (nom affiché, code hex, emoji)
 PRESET_COLORS = [
     ("Rose", "FF69B4", "🩷"),
