@@ -1,7 +1,7 @@
 """
 database.py — Gère la sauvegarde des données du bot (avertissements, Premium,
-compteur de messages) dans une base SQLite locale (bot_data.db), pour que
-rien ne soit perdu si le bot redémarre ou plante.
+compteur de messages, owners du bot) dans une base SQLite locale (bot_data.db),
+pour que rien ne soit perdu si le bot redémarre ou plante.
 
 Ce fichier doit rester dans le même dossier que main.py.
 """
@@ -74,6 +74,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS message_counts (
             user_id INTEGER PRIMARY KEY,
             count INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_owners (
+            user_id INTEGER PRIMARY KEY,
+            added_by INTEGER NOT NULL,
+            added_at TEXT NOT NULL
         )
     """)
 
@@ -238,5 +246,43 @@ def save_message_counts(message_count_store: dict):
         "ON CONFLICT(user_id) DO UPDATE SET count = excluded.count",
         list(message_count_store.items()),
     )
+    conn.commit()
+    conn.close()
+
+
+# --- Owners du bot ---
+# Des utilisateurs "owner" ajoutés par le propriétaire réel du bot (celui du token/de l'app Discord).
+# Un owner ajouté peut utiliser toutes les commandes de modération sur n'importe quel serveur où le
+# bot est présent, sans avoir besoin des permissions Discord habituelles — sauf /premium generer,
+# qui reste réservée au propriétaire réel uniquement.
+
+def load_bot_owners() -> dict:
+    """Retourne {user_id: {"added_by": int, "added_at": str}}"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, added_by, added_at FROM bot_owners")
+    rows = cur.fetchall()
+    conn.close()
+    return {
+        row["user_id"]: {"added_by": row["added_by"], "added_at": row["added_at"]}
+        for row in rows
+    }
+
+
+def add_bot_owner(user_id: int, added_by: int, added_at: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO bot_owners (user_id, added_by, added_at) VALUES (?, ?, ?)",
+        (user_id, added_by, added_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_bot_owner(user_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM bot_owners WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
