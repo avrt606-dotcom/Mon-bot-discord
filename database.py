@@ -39,9 +39,16 @@ def init_db():
             guild_id INTEGER PRIMARY KEY,
             activated_by INTEGER NOT NULL,
             activated_at TEXT NOT NULL,
-            code TEXT NOT NULL
+            code TEXT NOT NULL,
+            color TEXT NOT NULL DEFAULT 'FFD700'
         )
     """)
+
+    # Migration : ajoute la colonne "color" si la base existait déjà avant cette fonctionnalité.
+    try:
+        cur.execute("ALTER TABLE premium_servers ADD COLUMN color TEXT NOT NULL DEFAULT 'FFD700'")
+    except sqlite3.OperationalError:
+        pass  # la colonne existe déjà
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS premium_codes (
@@ -122,7 +129,7 @@ def clear_warnings(user_id: int):
 def load_premium_servers() -> dict:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT guild_id, activated_by, activated_at, code FROM premium_servers")
+    cur.execute("SELECT guild_id, activated_by, activated_at, code, color FROM premium_servers")
     rows = cur.fetchall()
     conn.close()
 
@@ -131,18 +138,27 @@ def load_premium_servers() -> dict:
             "activated_by": row["activated_by"],
             "activated_at": datetime.datetime.fromisoformat(row["activated_at"]),
             "code": row["code"],
+            "color": row["color"] or "FFD700",
         }
         for row in rows
     }
 
 
-def add_premium_server(guild_id: int, activated_by: int, activated_at: str, code: str):
+def add_premium_server(guild_id: int, activated_by: int, activated_at: str, code: str, color: str = "FFD700"):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO premium_servers (guild_id, activated_by, activated_at, code) VALUES (?, ?, ?, ?)",
-        (guild_id, activated_by, activated_at, code),
+        "INSERT OR REPLACE INTO premium_servers (guild_id, activated_by, activated_at, code, color) VALUES (?, ?, ?, ?, ?)",
+        (guild_id, activated_by, activated_at, code, color),
     )
+    conn.commit()
+    conn.close()
+
+
+def update_premium_color(guild_id: int, color: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE premium_servers SET color = ? WHERE guild_id = ?", (color, guild_id))
     conn.commit()
     conn.close()
 
