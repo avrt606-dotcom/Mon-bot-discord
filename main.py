@@ -55,6 +55,29 @@ def is_premium(guild_id: int) -> bool:
     return guild_id in premium_servers
 
 
+def get_premium_color(guild_id: int) -> discord.Color:
+    """Retourne la couleur choisie par le serveur premium, ou doré par défaut."""
+    data = premium_servers.get(guild_id)
+    hex_value = data["color"] if data else "FFD700"
+    try:
+        return discord.Color(int(hex_value, 16))
+    except (ValueError, TypeError):
+        return discord.Color.gold()
+
+
+def parse_hex_color(texte: str):
+    """Valide et convertit un texte comme '#FF5733' ou 'ff5733' en code hex propre (6 caractères).
+    Retourne None si le format est invalide."""
+    texte = texte.strip().lstrip("#").upper()
+    if len(texte) != 6:
+        return None
+    try:
+        int(texte, 16)
+    except ValueError:
+        return None
+    return texte
+
+
 def generate_premium_code() -> str:
     import random
     import string
@@ -69,7 +92,7 @@ def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderat
     Si le serveur est Premium, l'embed passe en doré avec un badge ✨."""
     premium = guild is not None and is_premium(guild.id)
     if premium:
-        color = discord.Color.gold()
+        color = get_premium_color(guild.id)
 
     embed = discord.Embed(
         title=f"{emoji} {title}" + (" ✨" if premium else ""),
@@ -114,7 +137,7 @@ async def ping(interaction: discord.Interaction):
 async def info(interaction: discord.Interaction, utilisateur: discord.Member = None):
     utilisateur = utilisateur or interaction.user
 
-    couleur = discord.Color.gold() if is_premium(interaction.guild.id) else (utilisateur.color if utilisateur.color != discord.Color.default() else discord.Color.blurple())
+    couleur = get_premium_color(interaction.guild.id) if is_premium(interaction.guild.id) else (utilisateur.color if utilisateur.color != discord.Color.default() else discord.Color.blurple())
     embed = discord.Embed(
         title=f"Informations sur {utilisateur.display_name}" + (" ✨" if is_premium(interaction.guild.id) else ""),
         color=couleur,
@@ -694,8 +717,9 @@ async def premium_activer(interaction: discord.Interaction, code: str):
         "activated_by": interaction.user.id,
         "activated_at": activated_at,
         "code": code,
+        "color": "FFD700",
     }
-    db.add_premium_server(interaction.guild.id, interaction.user.id, activated_at.isoformat(), code)
+    db.add_premium_server(interaction.guild.id, interaction.user.id, activated_at.isoformat(), code, "FFD700")
 
     embed = discord.Embed(
         title="🎉 Serveur passé Premium !",
@@ -706,8 +730,9 @@ async def premium_activer(interaction: discord.Interaction, code: str):
     embed.add_field(
         name="✨ Bonus débloqués",
         value=(
-            "• Embeds dorés sur toutes les commandes de modération\n"
+            "• Embeds colorés sur toutes les commandes de modération\n"
             "• Badge ✨ Premium sur `/info` et `/warnings`\n"
+            "• Couleur personnalisable avec `/premium couleur`\n"
             "• Support prioritaire"
         ),
         inline=False,
@@ -718,6 +743,56 @@ async def premium_activer(interaction: discord.Interaction, code: str):
     await interaction.response.send_message(embed=embed)
 
 
+@premium_group.command(name="couleur", description="[Premium] Choisis la couleur des embeds du bot sur ce serveur")
+@app_commands.describe(couleur="Un code couleur hexadécimal, ex: #FF5733, 5865F2, 00FF00")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def premium_couleur(interaction: discord.Interaction, couleur: str):
+    if not is_premium(interaction.guild.id):
+        embed = discord.Embed(
+            title="✨ Fonctionnalité Premium",
+            description="La personnalisation de couleur est réservée aux serveurs Premium.\nUtilise `/premium activer` avec un code pour débloquer cette option.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    hex_color = parse_hex_color(couleur)
+    if hex_color is None:
+        embed = discord.Embed(
+            title="❌ Couleur invalide",
+            description="Utilise un code hexadécimal valide, par exemple `#FF5733`, `5865F2` ou `00FF00`.",
+            color=discord.Color.red(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    premium_servers[interaction.guild.id]["color"] = hex_color
+    db.update_premium_color(interaction.guild.id, hex_color)
+
+    embed = discord.Embed(
+        title="🎨 Couleur mise à jour !",
+        description="Tous les embeds du bot sur ce serveur utiliseront désormais cette couleur.",
+        color=discord.Color(int(hex_color, 16)),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.add_field(name="Nouvelle couleur", value=f"`#{hex_color}`", inline=True)
+    embed.set_footer(text=f"Changé par {interaction.user}")
+    await interaction.response.send_message(embed=embed)
+
+
+@premium_couleur.error
+async def premium_couleur_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        embed = discord.Embed(
+            title="⛔ Permission manquante",
+            description="Il faut la permission **Gérer le serveur** pour changer la couleur Premium.",
+            color=discord.Color.red(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Une erreur est survenue : {error}", ephemeral=True)
+
+
 @premium_group.command(name="status", description="Vérifie si ce serveur profite du Premium")
 async def premium_status(interaction: discord.Interaction):
     if is_premium(interaction.guild.id):
@@ -725,7 +800,7 @@ async def premium_status(interaction: discord.Interaction):
         embed = discord.Embed(
             title="✨ Serveur Premium",
             description=f"**{interaction.guild.name}** profite du service Premium !",
-            color=discord.Color.gold(),
+            color=get_premium_color(interaction.guild.id),
             timestamp=datetime.datetime.now(),
         )
         activateur = interaction.guild.get_member(data["activated_by"])
@@ -735,6 +810,8 @@ async def premium_status(interaction: discord.Interaction):
             inline=False,
         )
         embed.add_field(name="Activé par", value=activateur.mention if activateur else "Inconnu", inline=False)
+        embed.add_field(name="Couleur actuelle", value=f"`#{data.get('color', 'FFD700')}`", inline=False)
+        embed.set_footer(text="Change-la avec /premium couleur")
         if interaction.guild.icon:
             embed.set_thumbnail(url=interaction.guild.icon.url)
     else:
