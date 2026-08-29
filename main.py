@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
+import datetime
 
 # Les "intents" définissent quelles infos le bot peut recevoir de Discord
 intents = discord.Intents.default()
@@ -165,6 +166,112 @@ async def mute_demute_error(interaction: discord.Interaction, error):
 warnings_store = {}
 
 
+def build_warn_notification_embed(utilisateur: discord.Member, moderateur: discord.Member, raison: str, total: int) -> discord.Embed:
+    """Embed affiché dans le salon quand quelqu'un reçoit un avertissement."""
+    embed = discord.Embed(
+        title="⚠️ Avertissement donné",
+        description=f"{utilisateur.mention} a reçu un avertissement.",
+        color=discord.Color.orange(),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_author(name=str(utilisateur), icon_url=utilisateur.display_avatar.url)
+    embed.set_thumbnail(url=utilisateur.display_avatar.url)
+    embed.add_field(name="Raison", value=raison, inline=False)
+    embed.add_field(name="Modérateur", value=moderateur.mention, inline=True)
+    embed.add_field(name="Total d'avertissements", value=str(total), inline=True)
+    embed.set_footer(text=f"ID : {utilisateur.id}")
+    return embed
+
+
+def build_warnings_embed(utilisateur: discord.Member, user_warnings: list) -> discord.Embed:
+    """Embed listant les avertissements d'un membre, utilisé par /warnings."""
+    embed = discord.Embed(
+        title=f"Avertissements de {utilisateur}",
+        color=discord.Color.orange() if user_warnings else discord.Color.green(),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_author(name=str(utilisateur), icon_url=utilisateur.display_avatar.url)
+    embed.set_thumbnail(url=utilisateur.display_avatar.url)
+    embed.set_footer(text=f"ID : {utilisateur.id}")
+
+    if not user_warnings:
+        embed.description = "✅ Ce membre n'a aucun avertissement."
+        return embed
+
+    embed.description = f"**{len(user_warnings)}** avertissement(s) au total."
+    for i, w in enumerate(user_warnings, start=1):
+        embed.add_field(
+            name=f"#{i} — {w['timestamp']}",
+            value=f"**Raison :** {w['reason']}\n**Par :** {w['moderator']}",
+            inline=False,
+        )
+    return embed
+
+
+class WarningDeleteSelect(discord.ui.Select):
+    """Menu déroulant permettant de choisir quel avertissement supprimer."""
+
+    def __init__(self, utilisateur: discord.Member, user_warnings: list, author_id: int):
+        self.utilisateur = utilisateur
+        self.author_id = author_id
+
+        options = [
+            discord.SelectOption(
+                label=f"Avertissement #{i + 1}",
+                description=(w["reason"][:95] + "…") if len(w["reason"]) > 95 else w["reason"],
+                value=str(i),
+                emoji="🗑️",
+            )
+            for i, w in enumerate(user_warnings)
+        ]
+
+        super().__init__(
+            placeholder="🗑️ Choisis l'avertissement à supprimer...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Seule la personne qui a lancé la commande peut supprimer un avertissement.",
+                ephemeral=True,
+            )
+            return
+
+        index = int(self.values[0])
+        user_warnings = warnings_store.get(self.utilisateur.id, [])
+
+        if index >= len(user_warnings):
+            await interaction.response.send_message(
+                "Cet avertissement n'existe plus (il a peut-être déjà été supprimé).",
+                ephemeral=True,
+            )
+            return
+
+        removed = user_warnings.pop(index)
+        warnings_store[self.utilisateur.id] = user_warnings
+
+        new_embed = build_warnings_embed(self.utilisateur, user_warnings)
+        new_view = WarningDeleteView(self.utilisateur, user_warnings, self.author_id) if user_warnings else None
+
+        await interaction.response.edit_message(embed=new_embed, view=new_view)
+        await interaction.followup.send(
+            f"🗑️ Avertissement supprimé : *{removed['reason']}*",
+            ephemeral=True,
+        )
+
+
+class WarningDeleteView(discord.ui.View):
+    """Vue contenant le menu de suppression d'avertissements."""
+
+    def __init__(self, utilisateur: discord.Member, user_warnings: list, author_id: int):
+        super().__init__(timeout=120)
+        if user_warnings:
+            self.add_item(WarningDeleteSelect(utilisateur, user_warnings, author_id))
+
+
 @bot.tree.command(name="ban", description="Bannit un membre du serveur")
 @app_commands.describe(
     utilisateur="La personne à bannir",
@@ -265,8 +372,6 @@ async def kick(interaction: discord.Interaction, utilisateur: discord.Member, ra
 )
 @app_commands.checks.has_permissions(moderate_members=True)
 async def warn(interaction: discord.Interaction, utilisateur: discord.Member, raison: str = "Aucune raison fournie"):
-    import datetime
-
     user_warnings = warnings_store.setdefault(utilisateur.id, [])
     user_warnings.append({
         "moderator": interaction.user.mention,
@@ -274,10 +379,8 @@ async def warn(interaction: discord.Interaction, utilisateur: discord.Member, ra
         "timestamp": datetime.datetime.now().strftime("%d/%m/%Y %H:%M"),
     })
 
-    await interaction.response.send_message(
-        f"{utilisateur.mention} a reçu un avertissement de {interaction.user.mention}. "
-        f"Raison : {raison} (Total : {len(user_warnings)} avertissement(s))"
-    )
+    embed = build_warn_notification_embed(utilisateur, interaction.user, raison, len(user_warnings))
+    await interaction.response.send_message(embed=embed)
 
     try:
         await utilisateur.send(
@@ -293,18 +396,10 @@ async def warn(interaction: discord.Interaction, utilisateur: discord.Member, ra
 async def warnings_cmd(interaction: discord.Interaction, utilisateur: discord.Member):
     user_warnings = warnings_store.get(utilisateur.id, [])
 
-    if not user_warnings:
-        await interaction.response.send_message(
-            f"{utilisateur.mention} n'a aucun avertissement.",
-            ephemeral=True,
-        )
-        return
+    embed = build_warnings_embed(utilisateur, user_warnings)
+    view = WarningDeleteView(utilisateur, user_warnings, interaction.user.id) if user_warnings else None
 
-    lines = [f"Avertissements de {utilisateur.mention} ({len(user_warnings)}) :"]
-    for i, w in enumerate(user_warnings, start=1):
-        lines.append(f"**{i}.** {w['reason']} — par {w['moderator']} le {w['timestamp']}")
-
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @bot.tree.command(name="clearwarnings", description="Efface tous les avertissements d'un membre")
