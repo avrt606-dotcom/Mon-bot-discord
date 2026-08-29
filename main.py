@@ -269,15 +269,23 @@ async def help_cmd(interaction: discord.Interaction):
     )
 
     embed.add_field(
+        name="👋 Bienvenue / Départ",
+        value=(
+            "`/bienvenue` — Configure le message d'arrivée des nouveaux membres\n"
+            "`/depart` — Configure le message affiché quand un membre part\n"
+            "✨ Premium : personnalise le texte et ajoute une image (sinon message par défaut)"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
         name="✨ Premium",
         value=(
             "`/premium status` — Vérifie si le serveur est Premium\n"
             "`/premium activer` — Active le Premium avec un code\n"
             "`/premium couleur` — Personnalise la couleur des embeds\n"
             "`/premium logs` — Configure le salon de logs de modération\n"
-            "`/premium sanctions` — Configure les sanctions automatiques\n"
-            "`/premium bienvenue` — Configure le message de bienvenue\n"
-            "`/premium depart` — Configure le message de départ"
+            "`/premium sanctions` — Configure les sanctions automatiques"
         ),
         inline=False,
     )
@@ -1408,7 +1416,7 @@ async def premium_activer(interaction: discord.Interaction, code: str):
             "• Couleur personnalisable avec `/premium couleur`\n"
             "• Salon de logs de modération avec `/premium logs`\n"
             "• Sanctions automatiques avec `/premium sanctions`\n"
-            "• Messages de bienvenue/départ avec `/premium bienvenue` et `/premium depart`\n"
+            "• Texte personnalisé + image sur `/bienvenue` et `/depart`\n"
             "• Support prioritaire"
         ),
         inline=False,
@@ -1593,103 +1601,153 @@ async def premium_sanctions_retirer(interaction: discord.Interaction, seuil: app
     await interaction.response.send_message(f"✅ Sanction automatique retirée pour le seuil {seuil}.", ephemeral=True)
 
 
-@premium_group.command(name="bienvenue", description="[Premium] Configure le message de bienvenue des nouveaux membres")
+DEFAULT_WELCOME_MESSAGE = "Bienvenue {membre} sur **{serveur}** ! Nous sommes maintenant {nombre_membres} membres 🎉"
+DEFAULT_LEAVE_MESSAGE = "**{membre}** a quitté **{serveur}**. Nous sommes maintenant {nombre_membres} membres."
+
+
+@bot.tree.command(name="bienvenue", description="Configure le message de bienvenue des nouveaux membres")
 @app_commands.describe(
     salon="Le salon où poster le message de bienvenue (laisse vide pour désactiver)",
-    message="Le message. Variables : {membre}, {serveur}, {nombre_membres}",
+    message="[Premium] Personnalise le texte. Variables : {membre}, {serveur}, {nombre_membres}",
+    image="[Premium] URL d'une image à afficher dans le message de bienvenue",
 )
 @has_permissions_or_owner(manage_guild=True)
-async def premium_bienvenue(interaction: discord.Interaction, salon: discord.TextChannel = None, message: str = None):
-    if not is_premium(interaction.guild.id):
-        embed = discord.Embed(
-            title="✨ Fonctionnalité Premium",
-            description="Le message de bienvenue personnalisé est réservé aux serveurs Premium.\nUtilise `/premium activer` avec un code pour débloquer cette option.",
-            color=discord.Color.greyple(),
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
+async def bienvenue(interaction: discord.Interaction, salon: discord.TextChannel = None, message: str = None, image: str = None):
+    premium = is_premium(interaction.guild.id)
 
     if salon is None:
         welcome_store[interaction.guild.id] = {
             **welcome_store.get(interaction.guild.id, {}),
             "welcome_channel_id": None,
             "welcome_message": None,
+            "welcome_image_url": None,
         }
-        db.set_welcome_config(interaction.guild.id, None, None)
+        db.set_welcome_config(interaction.guild.id, None, None, None)
         await interaction.response.send_message("🔕 Message de bienvenue désactivé.", ephemeral=True)
         return
 
-    message = message or "Bienvenue {membre} sur **{serveur}** ! Nous sommes maintenant {nombre_membres} membres 🎉"
+    # La personnalisation du texte et l'image sont réservées au Premium.
+    # Les serveurs non-Premium peuvent quand même activer un message par défaut.
+    avertissement = None
+    if (message is not None or image is not None) and not premium:
+        avertissement = (
+            "✨ La personnalisation du message et l'ajout d'une image sont réservés aux serveurs Premium. "
+            "Le message par défaut a été utilisé à la place. Utilise `/premium activer` pour débloquer ces options."
+        )
+        message = None
+        image = None
+
+    final_message = message or DEFAULT_WELCOME_MESSAGE
+    final_image = image if premium else None
 
     welcome_store[interaction.guild.id] = {
         **welcome_store.get(interaction.guild.id, {}),
         "welcome_channel_id": salon.id,
-        "welcome_message": message,
+        "welcome_message": final_message,
+        "welcome_image_url": final_image,
     }
-    db.set_welcome_config(interaction.guild.id, salon.id, message)
+    db.set_welcome_config(interaction.guild.id, salon.id, final_message, final_image)
 
-    apercu = message.format(membre=interaction.user.mention, serveur=interaction.guild.name, nombre_membres=interaction.guild.member_count)
+    apercu = final_message.format(membre=interaction.user.mention, serveur=interaction.guild.name, nombre_membres=interaction.guild.member_count)
     embed = discord.Embed(
-        title="👋 Message de bienvenue configuré",
+        title="👋 Message de bienvenue configuré" + (" ✨" if premium else ""),
         description=f"Les nouveaux membres seront accueillis dans {salon.mention} avec ce message :\n\n{apercu}",
-        color=get_premium_color(interaction.guild.id),
+        color=get_premium_color(interaction.guild.id) if premium else discord.Color.blurple(),
         timestamp=datetime.datetime.now(),
     )
+    if final_image:
+        embed.set_image(url=final_image)
+    if not premium:
+        embed.add_field(
+            name="✨ Envie de plus ?",
+            value="Passe Premium pour personnaliser le texte du message et ajouter une image avec `/bienvenue message:... image:...`.",
+            inline=False,
+        )
+    if avertissement:
+        embed.add_field(name="⚠️ Info", value=avertissement, inline=False)
     embed.set_footer(text="Variables disponibles : {membre}, {serveur}, {nombre_membres}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@premium_group.command(name="depart", description="[Premium] Configure le message affiché quand un membre quitte le serveur")
+@bot.tree.command(name="depart", description="Configure le message affiché quand un membre quitte le serveur")
 @app_commands.describe(
     salon="Le salon où poster le message de départ (laisse vide pour désactiver)",
-    message="Le message. Variables : {membre}, {serveur}, {nombre_membres}",
+    message="[Premium] Personnalise le texte. Variables : {membre}, {serveur}, {nombre_membres}",
+    image="[Premium] URL d'une image à afficher dans le message de départ",
 )
 @has_permissions_or_owner(manage_guild=True)
-async def premium_depart(interaction: discord.Interaction, salon: discord.TextChannel = None, message: str = None):
-    if not is_premium(interaction.guild.id):
-        embed = discord.Embed(
-            title="✨ Fonctionnalité Premium",
-            description="Le message de départ personnalisé est réservé aux serveurs Premium.\nUtilise `/premium activer` avec un code pour débloquer cette option.",
-            color=discord.Color.greyple(),
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
+async def depart(interaction: discord.Interaction, salon: discord.TextChannel = None, message: str = None, image: str = None):
+    premium = is_premium(interaction.guild.id)
 
     if salon is None:
         welcome_store[interaction.guild.id] = {
             **welcome_store.get(interaction.guild.id, {}),
             "leave_channel_id": None,
             "leave_message": None,
+            "leave_image_url": None,
         }
-        db.set_leave_config(interaction.guild.id, None, None)
+        db.set_leave_config(interaction.guild.id, None, None, None)
         await interaction.response.send_message("🔕 Message de départ désactivé.", ephemeral=True)
         return
 
-    message = message or "**{membre}** a quitté **{serveur}**. Nous sommes maintenant {nombre_membres} membres."
+    avertissement = None
+    if (message is not None or image is not None) and not premium:
+        avertissement = (
+            "✨ La personnalisation du message et l'ajout d'une image sont réservés aux serveurs Premium. "
+            "Le message par défaut a été utilisé à la place. Utilise `/premium activer` pour débloquer ces options."
+        )
+        message = None
+        image = None
+
+    final_message = message or DEFAULT_LEAVE_MESSAGE
+    final_image = image if premium else None
 
     welcome_store[interaction.guild.id] = {
         **welcome_store.get(interaction.guild.id, {}),
         "leave_channel_id": salon.id,
-        "leave_message": message,
+        "leave_message": final_message,
+        "leave_image_url": final_image,
     }
-    db.set_leave_config(interaction.guild.id, salon.id, message)
+    db.set_leave_config(interaction.guild.id, salon.id, final_message, final_image)
 
-    apercu = message.format(membre=str(interaction.user), serveur=interaction.guild.name, nombre_membres=interaction.guild.member_count)
+    apercu = final_message.format(membre=str(interaction.user), serveur=interaction.guild.name, nombre_membres=interaction.guild.member_count)
     embed = discord.Embed(
-        title="👋 Message de départ configuré",
+        title="👋 Message de départ configuré" + (" ✨" if premium else ""),
         description=f"Les départs seront annoncés dans {salon.mention} avec ce message :\n\n{apercu}",
-        color=get_premium_color(interaction.guild.id),
+        color=get_premium_color(interaction.guild.id) if premium else discord.Color.blurple(),
         timestamp=datetime.datetime.now(),
     )
+    if final_image:
+        embed.set_image(url=final_image)
+    if not premium:
+        embed.add_field(
+            name="✨ Envie de plus ?",
+            value="Passe Premium pour personnaliser le texte du message et ajouter une image avec `/depart message:... image:...`.",
+            inline=False,
+        )
+    if avertissement:
+        embed.add_field(name="⚠️ Info", value=avertissement, inline=False)
     embed.set_footer(text="Variables disponibles : {membre}, {serveur}, {nombre_membres}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bienvenue.error
+@depart.error
+async def welcome_config_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        embed = discord.Embed(
+            title="⛔ Permission manquante",
+            description="Il faut la permission **Gérer le serveur** pour configurer les messages de bienvenue/départ.",
+            color=discord.Color.red(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Une erreur est survenue : {error}", ephemeral=True)
 
 
 @premium_logs.error
 @premium_sanctions.error
 @premium_sanctions_retirer.error
-@premium_bienvenue.error
-@premium_depart.error
 async def premium_config_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         embed = discord.Embed(
@@ -1731,7 +1789,11 @@ async def premium_status(interaction: discord.Interaction):
         w_config = welcome_store.get(interaction.guild.id, {})
         bienvenue_active = bool(w_config.get("welcome_channel_id"))
         depart_active = bool(w_config.get("leave_channel_id"))
-        embed.add_field(name="Bienvenue / Départ", value=f"{'✅' if bienvenue_active else '❌'} Bienvenue — {'✅' if depart_active else '❌'} Départ", inline=True)
+        embed.add_field(
+            name="Bienvenue / Départ",
+            value=f"{'✅' if bienvenue_active else '❌'} Bienvenue — {'✅' if depart_active else '❌'} Départ\n(images et texte personnalisé débloqués)",
+            inline=True,
+        )
 
         embed.set_footer(text="Change-la avec /premium couleur")
         if interaction.guild.icon:
@@ -1754,9 +1816,7 @@ print(f"[DB] {len(welcome_store)} config(s) de bienvenue/départ chargée(s) dep
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    if not is_premium(member.guild.id):
-        return
-
+    # Disponible pour tous les serveurs ayant configuré /bienvenue.
     config = welcome_store.get(member.guild.id)
     if not config or not config.get("welcome_channel_id") or not config.get("welcome_message"):
         return
@@ -1774,14 +1834,24 @@ async def on_member_join(member: discord.Member):
     except (KeyError, IndexError):
         texte = config["welcome_message"]
 
+    premium = is_premium(member.guild.id)
     embed = discord.Embed(
-        title="👋 Nouveau membre !",
+        title="👋 Nouveau membre !" + (" ✨" if premium else ""),
         description=texte,
-        color=get_premium_color(member.guild.id),
+        color=get_premium_color(member.guild.id) if premium else discord.Color.blurple(),
         timestamp=datetime.datetime.now(),
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"✨ Serveur Premium — {member.guild.member_count} membre(s)")
+
+    # L'image/bannière personnalisée n'est disponible que sur les serveurs Premium.
+    image_url = config.get("welcome_image_url")
+    if premium and image_url:
+        embed.set_image(url=image_url)
+
+    footer = f"{member.guild.member_count} membre(s)"
+    if premium:
+        footer = f"✨ Serveur Premium — {footer}"
+    embed.set_footer(text=footer)
 
     try:
         await channel.send(embed=embed)
@@ -1791,9 +1861,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    if not is_premium(member.guild.id):
-        return
-
+    # Disponible pour tous les serveurs ayant configuré /depart.
     config = welcome_store.get(member.guild.id)
     if not config or not config.get("leave_channel_id") or not config.get("leave_message"):
         return
@@ -1811,14 +1879,23 @@ async def on_member_remove(member: discord.Member):
     except (KeyError, IndexError):
         texte = config["leave_message"]
 
+    premium = is_premium(member.guild.id)
     embed = discord.Embed(
-        title="👋 Départ d'un membre",
+        title="👋 Départ d'un membre" + (" ✨" if premium else ""),
         description=texte,
         color=discord.Color.greyple(),
         timestamp=datetime.datetime.now(),
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"✨ Serveur Premium — {member.guild.member_count} membre(s)")
+
+    image_url = config.get("leave_image_url")
+    if premium and image_url:
+        embed.set_image(url=image_url)
+
+    footer = f"{member.guild.member_count} membre(s)"
+    if premium:
+        footer = f"✨ Serveur Premium — {footer}"
+    embed.set_footer(text=footer)
 
     try:
         await channel.send(embed=embed)
