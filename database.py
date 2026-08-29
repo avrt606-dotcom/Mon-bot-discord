@@ -1,6 +1,7 @@
 """
 database.py — Gère la sauvegarde des données du bot (avertissements, Premium,
-compteur de messages, owners du bot) dans une base SQLite locale (bot_data.db),
+compteur de messages, owners du bot, logs de modération, sanctions auto,
+messages de bienvenue/départ) dans une base SQLite locale (bot_data.db),
 pour que rien ne soit perdu si le bot redémarre ou plante.
 
 Ce fichier doit rester dans le même dossier que main.py.
@@ -82,6 +83,35 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             added_by INTEGER NOT NULL,
             added_at TEXT NOT NULL
+        )
+    """)
+
+    # --- Nouveau : salon de logs de modération par serveur (Premium) ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mod_logs_config (
+            guild_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL
+        )
+    """)
+
+    # --- Nouveau : configuration des sanctions automatiques par serveur (Premium) ---
+    # actions_json est un texte JSON du type {"3": "mute:10m", "5": "kick", "7": "ban"}
+    # où la clé est le nombre de warnings cumulés et la valeur l'action à déclencher.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS auto_sanctions_config (
+            guild_id INTEGER PRIMARY KEY,
+            actions_json TEXT NOT NULL
+        )
+    """)
+
+    # --- Nouveau : message de bienvenue / départ personnalisé par serveur (Premium) ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS welcome_config (
+            guild_id INTEGER PRIMARY KEY,
+            welcome_channel_id INTEGER,
+            welcome_message TEXT,
+            leave_channel_id INTEGER,
+            leave_message TEXT
         )
     """)
 
@@ -284,5 +314,157 @@ def remove_bot_owner(user_id: int):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM bot_owners WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+# --- Logs de modération (Premium) ---
+# Un seul salon de logs par serveur. Toutes les actions de modération (mute, ban,
+# kick, warn, clear, lock, unlock, rôles, pseudo...) y sont automatiquement postées.
+
+def load_mod_logs_config() -> dict:
+    """Retourne {guild_id: channel_id}"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT guild_id, channel_id FROM mod_logs_config")
+    rows = cur.fetchall()
+    conn.close()
+    return {row["guild_id"]: row["channel_id"] for row in rows}
+
+
+def set_mod_logs_channel(guild_id: int, channel_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO mod_logs_config (guild_id, channel_id) VALUES (?, ?)",
+        (guild_id, channel_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_mod_logs_channel(guild_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM mod_logs_config WHERE guild_id = ?", (guild_id,))
+    conn.commit()
+    conn.close()
+
+
+# --- Sanctions automatiques (Premium) ---
+# Configuration par serveur : à partir de X warnings cumulés, une action est déclenchée
+# automatiquement (mute d'une durée donnée, kick, ou ban).
+
+def load_auto_sanctions_config() -> dict:
+    """Retourne {guild_id: {seuil_int: "action"}}, ex: {123: {3: "mute:10m", 5: "kick"}}"""
+    import json
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT guild_id, actions_json FROM auto_sanctions_config")
+    rows = cur.fetchall()
+    conn.close()
+
+    result = {}
+    for row in rows:
+        try:
+            raw = json.loads(row["actions_json"])
+            result[row["guild_id"]] = {int(k): v for k, v in raw.items()}
+        except (ValueError, TypeError):
+            result[row["guild_id"]] = {}
+    return result
+
+
+def set_auto_sanctions_config(guild_id: int, actions: dict):
+    """actions : {seuil_int: "action"}, ex: {3: "mute:10m", 5: "kick", 7: "ban"}"""
+    import json
+    conn = get_connection()
+    cur = conn.cursor()
+    actions_json = json.dumps({str(k): v for k, v in actions.items()})
+    cur.execute(
+        "INSERT OR REPLACE INTO auto_sanctions_config (guild_id, actions_json) VALUES (?, ?)",
+        (guild_id, actions_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_auto_sanctions_config(guild_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM auto_sanctions_config WHERE guild_id = ?", (guild_id,))
+    conn.commit()
+    conn.close()
+
+
+# --- Message de bienvenue / départ (Premium) ---
+
+def load_welcome_config() -> dict:
+    """Retourne {guild_id: {welcome_channel_id, welcome_message, leave_channel_id, leave_message}}"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT guild_id, welcome_channel_id, welcome_message, leave_channel_id, leave_message FROM welcome_config"
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        row["guild_id"]: {
+            "welcome_channel_id": row["welcome_channel_id"],
+            "welcome_message": row["welcome_message"],
+            "leave_channel_id": row["leave_channel_id"],
+            "leave_message": row["leave_message"],
+        }
+        for row in rows
+    }
+
+
+def _get_or_create_welcome_row(guild_id: int) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM welcome_config WHERE guild_id = ?", (guild_id,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT INTO welcome_config (guild_id, welcome_channel_id, welcome_message, leave_channel_id, leave_message) "
+            "VALUES (?, NULL, NULL, NULL, NULL)",
+            (guild_id,),
+        )
+        conn.commit()
+        data = {"welcome_channel_id": None, "welcome_message": None, "leave_channel_id": None, "leave_message": None}
+    else:
+        data = dict(row)
+    conn.close()
+    return data
+
+
+def set_welcome_config(guild_id: int, channel_id: int, message: str):
+    _get_or_create_welcome_row(guild_id)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE welcome_config SET welcome_channel_id = ?, welcome_message = ? WHERE guild_id = ?",
+        (channel_id, message, guild_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_leave_config(guild_id: int, channel_id: int, message: str):
+    _get_or_create_welcome_row(guild_id)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE welcome_config SET leave_channel_id = ?, leave_message = ? WHERE guild_id = ?",
+        (channel_id, message, guild_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_welcome_config(guild_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM welcome_config WHERE guild_id = ?", (guild_id,))
     conn.commit()
     conn.close()
