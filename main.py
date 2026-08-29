@@ -15,6 +15,7 @@ print(f"[DB] Le fichier existait déjà avant ce lancement : {fichier_existait_d
 # Les "intents" définissent quelles infos le bot peut recevoir de Discord
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # nécessaire pour on_member_join / on_member_remove (bienvenue-départ)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -171,6 +172,34 @@ def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderat
     return embed
 
 
+# --- Logs de modération (Premium) ---
+# mod_logs_store : {guild_id: channel_id}
+# Si un serveur Premium a configuré un salon de logs, toute action de modération
+# (mute, ban, kick, warn, clear, lock, unlock, rôle, pseudo...) y est postée automatiquement.
+mod_logs_store = db.load_mod_logs_config()
+print(f"[DB] {len(mod_logs_store)} config(s) de logs de modération chargée(s) depuis la base.")
+
+
+async def send_mod_log(guild: discord.Guild, embed: discord.Embed):
+    """Envoie une copie de l'embed d'action dans le salon de logs configuré, si le
+    serveur est Premium et a un salon de logs actif. Échoue silencieusement sinon."""
+    if guild is None or not is_premium(guild.id):
+        return
+
+    channel_id = mod_logs_store.get(guild.id)
+    if channel_id is None:
+        return
+
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return
+
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 @bot.tree.command(name="ping", description="Vérifie que le bot répond bien")
 async def ping(interaction: discord.Interaction):
     latence_ms = round(bot.latency * 1000)
@@ -244,7 +273,11 @@ async def help_cmd(interaction: discord.Interaction):
         value=(
             "`/premium status` — Vérifie si le serveur est Premium\n"
             "`/premium activer` — Active le Premium avec un code\n"
-            "`/premium couleur` — Personnalise la couleur des embeds"
+            "`/premium couleur` — Personnalise la couleur des embeds\n"
+            "`/premium logs` — Configure le salon de logs de modération\n"
+            "`/premium sanctions` — Configure les sanctions automatiques\n"
+            "`/premium bienvenue` — Configure le message de bienvenue\n"
+            "`/premium depart` — Configure le message de départ"
         ),
         inline=False,
     )
@@ -449,6 +482,7 @@ async def mute(interaction: discord.Interaction, utilisateur: discord.Member, du
         owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
     # Tentative d'envoi d'un MP à la personne mutée
     try:
@@ -478,6 +512,7 @@ async def demute(interaction: discord.Interaction, utilisateur: discord.Member, 
 
     embed = build_mod_embed("🔊", "Membre démute", discord.Color.green(), utilisateur, interaction.user, raison, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
     try:
         await utilisateur.send(f"Tu as été démute par {interaction.user.mention}. Raison : {raison}")
@@ -504,6 +539,97 @@ async def mute_demute_error(interaction: discord.Interaction, error):
 # Chargé depuis la base SQLite au démarrage, et écrit dans la base à chaque changement.
 warnings_store = db.load_warnings()
 print(f"[DB] {len(warnings_store)} membre(s) avec des avertissements chargé(s) depuis la base.")
+
+# --- Sanctions automatiques (Premium) ---
+# auto_sanctions_store : {guild_id: {seuil_int: "action"}}, ex: {3: "mute:10m", 5: "kick", 7: "ban"}
+auto_sanctions_store = db.load_auto_sanctions_config()
+print(f"[DB] {len(auto_sanctions_store)} config(s) de sanctions automatiques chargée(s) depuis la base.")
+
+
+def parse_sanction_action(texte: str):
+    """Valide une action de sanction : 'mute:10m', 'kick' ou 'ban'.
+    Retourne (type, secondes_ou_None) ou None si invalide."""
+    texte = texte.strip().lower()
+    if texte == "kick":
+        return ("kick", None)
+    if texte == "ban":
+        return ("ban", None)
+    if texte.startswith("mute:"):
+        duree = parse_duration(texte.split(":", 1)[1])
+        if duree is None or duree > 28 * 24 * 3600:
+            return None
+        return ("mute", duree)
+    return None
+
+
+def build_sanction_embed(emoji: str, title: str, color: discord.Color, cible, raison: str, guild: discord.Guild) -> discord.Embed:
+    """Embed pour une sanction déclenchée automatiquement (pas de modérateur humain)."""
+    premium = guild is not None and is_premium(guild.id)
+    if premium:
+        color = get_premium_color(guild.id)
+
+    embed = discord.Embed(
+        title=f"{emoji} {title}" + (" ✨" if premium else ""),
+        color=color,
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_author(name=str(cible), icon_url=cible.display_avatar.url)
+    embed.set_thumbnail(url=cible.display_avatar.url)
+    embed.add_field(name="Membre", value=cible.mention, inline=True)
+    embed.add_field(name="Déclenchée par", value="🤖 Sanction automatique", inline=True)
+    embed.add_field(name="Raison", value=raison, inline=False)
+    footer = f"ID : {cible.id}"
+    if premium:
+        footer = f"✨ Serveur Premium — {footer}"
+    embed.set_footer(text=footer)
+    return embed
+
+
+async def check_auto_sanctions(guild: discord.Guild, utilisateur: discord.Member, total_warnings: int):
+    """Après un /warn, vérifie si le nombre total d'avertissements atteint un seuil
+    configuré pour ce serveur Premium, et applique la sanction correspondante."""
+    if guild is None or not is_premium(guild.id):
+        return
+
+    config = auto_sanctions_store.get(guild.id)
+    if not config or total_warnings not in config:
+        return
+
+    parsed = parse_sanction_action(config[total_warnings])
+    if parsed is None:
+        return
+
+    action_type, duree = parsed
+    raison = f"Sanction automatique : {total_warnings} avertissement(s) cumulé(s)"
+
+    try:
+        if action_type == "mute":
+            if utilisateur.is_timed_out():
+                return
+            await utilisateur.timeout(datetime.timedelta(seconds=duree), reason=raison)
+            embed = build_sanction_embed("🔇", "Mute automatique", discord.Color.orange(), utilisateur, raison, guild)
+            embed.add_field(name="Durée", value=format_duration(duree), inline=True)
+        elif action_type == "kick":
+            await utilisateur.kick(reason=raison)
+            embed = build_sanction_embed("👢", "Expulsion automatique", discord.Color.orange(), utilisateur, raison, guild)
+        elif action_type == "ban":
+            await utilisateur.ban(reason=raison)
+            embed = build_sanction_embed("🔨", "Bannissement automatique", discord.Color.red(), utilisateur, raison, guild)
+        else:
+            return
+    except discord.Forbidden:
+        return
+
+    # On tente de notifier dans le salon de logs. Si aucun salon de logs n'est configuré,
+    # la sanction reste appliquée mais ne sera visible que via /warnings ou /info.
+    await send_mod_log(guild, embed)
+
+    try:
+        await utilisateur.send(
+            f"Une sanction automatique a été appliquée sur {guild.name} suite à tes avertissements : {raison}"
+        )
+    except discord.Forbidden:
+        pass
 
 
 def build_warn_notification_embed(utilisateur: discord.Member, moderateur: discord.Member, raison: str, total: int) -> discord.Embed:
@@ -638,6 +764,7 @@ async def ban(interaction: discord.Interaction, utilisateur: discord.Member, rai
 
     embed = build_mod_embed("🔨", "Membre banni", discord.Color.red(), utilisateur, interaction.user, raison, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @bot.tree.command(name="unban", description="Débannit un membre via son ID")
@@ -674,6 +801,7 @@ async def unban(interaction: discord.Interaction, user_id: str, raison: str = "A
 
     embed = build_mod_embed("♻️", "Membre débanni", discord.Color.green(), user, interaction.user, raison, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @bot.tree.command(name="kick", description="Expulse un membre du serveur")
@@ -701,6 +829,7 @@ async def kick(interaction: discord.Interaction, utilisateur: discord.Member, ra
 
     embed = build_mod_embed("👢", "Membre expulsé", discord.Color.orange(), utilisateur, interaction.user, raison, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @bot.tree.command(name="warn", description="Donne un avertissement à un membre")
@@ -723,6 +852,7 @@ async def warn(interaction: discord.Interaction, utilisateur: discord.Member, ra
 
     embed = build_warn_notification_embed(utilisateur, interaction.user, raison, len(user_warnings))
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
     try:
         await utilisateur.send(
@@ -730,6 +860,9 @@ async def warn(interaction: discord.Interaction, utilisateur: discord.Member, ra
         )
     except discord.Forbidden:
         pass
+
+    # Vérifie si ce nombre d'avertissements déclenche une sanction automatique (Premium)
+    await check_auto_sanctions(interaction.guild, utilisateur, len(user_warnings))
 
 
 @bot.tree.command(name="warnings", description="Affiche les avertissements d'un membre")
@@ -752,6 +885,7 @@ async def clearwarnings(interaction: discord.Interaction, utilisateur: discord.M
     db.clear_warnings(utilisateur.id)
     embed = build_mod_embed("🧹", "Avertissements effacés", discord.Color.green(), utilisateur, interaction.user, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @ban.error
@@ -825,6 +959,7 @@ async def clear(interaction: discord.Interaction, nombre: app_commands.Range[int
         guild=interaction.guild, owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
+    await send_mod_log(interaction.guild, embed)
 
 
 @bot.tree.command(name="slowmode", description="Configure le mode lent (slowmode) du salon")
@@ -843,6 +978,7 @@ async def slowmode(interaction: discord.Interaction, secondes: app_commands.Rang
         guild=interaction.guild, owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @bot.tree.command(name="lock", description="Verrouille le salon (empêche @everyone d'écrire)")
@@ -860,6 +996,7 @@ async def lock(interaction: discord.Interaction, raison: str = "Aucune raison fo
         owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @bot.tree.command(name="unlock", description="Déverrouille le salon")
@@ -877,6 +1014,7 @@ async def unlock(interaction: discord.Interaction, raison: str = "Aucune raison 
         owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @bot.tree.command(name="pseudo", description="Change le pseudo d'un membre sur le serveur")
@@ -902,6 +1040,7 @@ async def pseudo(interaction: discord.Interaction, utilisateur: discord.Member, 
         guild=interaction.guild, owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @clear.error
@@ -1013,6 +1152,7 @@ async def role_add(interaction: discord.Interaction, utilisateur: discord.Member
         owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @role_group.command(name="remove", description="Retire un rôle à un membre")
@@ -1036,6 +1176,7 @@ async def role_remove(interaction: discord.Interaction, utilisateur: discord.Mem
         owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.response.send_message(embed=embed)
+    await send_mod_log(interaction.guild, embed)
 
 
 @role_add.error
@@ -1265,6 +1406,9 @@ async def premium_activer(interaction: discord.Interaction, code: str):
             "• Embeds colorés sur toutes les commandes de modération\n"
             "• Badge ✨ Premium sur `/info` et `/warnings`\n"
             "• Couleur personnalisable avec `/premium couleur`\n"
+            "• Salon de logs de modération avec `/premium logs`\n"
+            "• Sanctions automatiques avec `/premium sanctions`\n"
+            "• Messages de bienvenue/départ avec `/premium bienvenue` et `/premium depart`\n"
             "• Support prioritaire"
         ),
         inline=False,
@@ -1343,6 +1487,221 @@ async def premium_couleur_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(f"Une erreur est survenue : {error}", ephemeral=True)
 
 
+@premium_group.command(name="logs", description="[Premium] Configure le salon de logs de modération")
+@app_commands.describe(
+    salon="Le salon où poster les logs (laisse vide pour désactiver les logs)",
+)
+@has_permissions_or_owner(manage_guild=True)
+async def premium_logs(interaction: discord.Interaction, salon: discord.TextChannel = None):
+    if not is_premium(interaction.guild.id):
+        embed = discord.Embed(
+            title="✨ Fonctionnalité Premium",
+            description="Les logs de modération sont réservés aux serveurs Premium.\nUtilise `/premium activer` avec un code pour débloquer cette option.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if salon is None:
+        if interaction.guild.id in mod_logs_store:
+            del mod_logs_store[interaction.guild.id]
+            db.remove_mod_logs_channel(interaction.guild.id)
+        embed = discord.Embed(
+            title="🔕 Logs de modération désactivés",
+            description="Les actions de modération ne seront plus loguées automatiquement.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    mod_logs_store[interaction.guild.id] = salon.id
+    db.set_mod_logs_channel(interaction.guild.id, salon.id)
+
+    embed = discord.Embed(
+        title="📋 Logs de modération activés",
+        description=f"Toutes les actions de modération (mute, ban, kick, warn, clear, lock, rôle...) seront désormais postées dans {salon.mention}.",
+        color=get_premium_color(interaction.guild.id),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_footer(text=f"Configuré par {interaction.user}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    try:
+        await salon.send(embed=discord.Embed(
+            title="📋 Salon de logs configuré",
+            description="Ce salon recevra désormais toutes les actions de modération du bot.",
+            color=get_premium_color(interaction.guild.id),
+        ))
+    except discord.Forbidden:
+        pass
+
+
+@premium_group.command(name="sanctions", description="[Premium] Configure une sanction automatique à un certain nombre d'avertissements")
+@app_commands.describe(
+    seuil="Nombre d'avertissements cumulés qui déclenche la sanction",
+    action="L'action à appliquer : 'kick', 'ban', ou 'mute:DUREE' (ex: mute:1h)",
+)
+@has_permissions_or_owner(manage_guild=True)
+async def premium_sanctions(interaction: discord.Interaction, seuil: app_commands.Range[int, 1, 50], action: str):
+    if not is_premium(interaction.guild.id):
+        embed = discord.Embed(
+            title="✨ Fonctionnalité Premium",
+            description="Les sanctions automatiques sont réservées aux serveurs Premium.\nUtilise `/premium activer` avec un code pour débloquer cette option.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    parsed = parse_sanction_action(action)
+    if parsed is None:
+        await interaction.response.send_message(
+            "Action invalide. Utilise `kick`, `ban`, ou `mute:DUREE` (ex : `mute:10m`, `mute:1h`, `mute:1j`, max 28 jours).",
+            ephemeral=True,
+        )
+        return
+
+    config = auto_sanctions_store.setdefault(interaction.guild.id, {})
+    config[seuil] = action.strip().lower()
+    db.set_auto_sanctions_config(interaction.guild.id, config)
+
+    lignes = "\n".join(f"• **{s}** avertissement(s) → `{a}`" for s, a in sorted(config.items()))
+    embed = discord.Embed(
+        title="🤖 Sanctions automatiques mises à jour",
+        description=f"Configuration actuelle des sanctions automatiques sur ce serveur :\n\n{lignes}",
+        color=get_premium_color(interaction.guild.id),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_footer(text=f"Configuré par {interaction.user} • Utilise à nouveau la commande avec le même seuil pour le remplacer")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@premium_group.command(name="sanctions_retirer", description="[Premium] Retire un seuil de sanction automatique")
+@app_commands.describe(seuil="Le seuil d'avertissements à retirer")
+@has_permissions_or_owner(manage_guild=True)
+async def premium_sanctions_retirer(interaction: discord.Interaction, seuil: app_commands.Range[int, 1, 50]):
+    config = auto_sanctions_store.get(interaction.guild.id, {})
+    if seuil not in config:
+        await interaction.response.send_message(f"Aucune sanction automatique n'est configurée pour le seuil {seuil}.", ephemeral=True)
+        return
+
+    del config[seuil]
+    if config:
+        db.set_auto_sanctions_config(interaction.guild.id, config)
+    else:
+        db.remove_auto_sanctions_config(interaction.guild.id)
+
+    await interaction.response.send_message(f"✅ Sanction automatique retirée pour le seuil {seuil}.", ephemeral=True)
+
+
+@premium_group.command(name="bienvenue", description="[Premium] Configure le message de bienvenue des nouveaux membres")
+@app_commands.describe(
+    salon="Le salon où poster le message de bienvenue (laisse vide pour désactiver)",
+    message="Le message. Variables : {membre}, {serveur}, {nombre_membres}",
+)
+@has_permissions_or_owner(manage_guild=True)
+async def premium_bienvenue(interaction: discord.Interaction, salon: discord.TextChannel = None, message: str = None):
+    if not is_premium(interaction.guild.id):
+        embed = discord.Embed(
+            title="✨ Fonctionnalité Premium",
+            description="Le message de bienvenue personnalisé est réservé aux serveurs Premium.\nUtilise `/premium activer` avec un code pour débloquer cette option.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if salon is None:
+        welcome_store[interaction.guild.id] = {
+            **welcome_store.get(interaction.guild.id, {}),
+            "welcome_channel_id": None,
+            "welcome_message": None,
+        }
+        db.set_welcome_config(interaction.guild.id, None, None)
+        await interaction.response.send_message("🔕 Message de bienvenue désactivé.", ephemeral=True)
+        return
+
+    message = message or "Bienvenue {membre} sur **{serveur}** ! Nous sommes maintenant {nombre_membres} membres 🎉"
+
+    welcome_store[interaction.guild.id] = {
+        **welcome_store.get(interaction.guild.id, {}),
+        "welcome_channel_id": salon.id,
+        "welcome_message": message,
+    }
+    db.set_welcome_config(interaction.guild.id, salon.id, message)
+
+    apercu = message.format(membre=interaction.user.mention, serveur=interaction.guild.name, nombre_membres=interaction.guild.member_count)
+    embed = discord.Embed(
+        title="👋 Message de bienvenue configuré",
+        description=f"Les nouveaux membres seront accueillis dans {salon.mention} avec ce message :\n\n{apercu}",
+        color=get_premium_color(interaction.guild.id),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_footer(text="Variables disponibles : {membre}, {serveur}, {nombre_membres}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@premium_group.command(name="depart", description="[Premium] Configure le message affiché quand un membre quitte le serveur")
+@app_commands.describe(
+    salon="Le salon où poster le message de départ (laisse vide pour désactiver)",
+    message="Le message. Variables : {membre}, {serveur}, {nombre_membres}",
+)
+@has_permissions_or_owner(manage_guild=True)
+async def premium_depart(interaction: discord.Interaction, salon: discord.TextChannel = None, message: str = None):
+    if not is_premium(interaction.guild.id):
+        embed = discord.Embed(
+            title="✨ Fonctionnalité Premium",
+            description="Le message de départ personnalisé est réservé aux serveurs Premium.\nUtilise `/premium activer` avec un code pour débloquer cette option.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if salon is None:
+        welcome_store[interaction.guild.id] = {
+            **welcome_store.get(interaction.guild.id, {}),
+            "leave_channel_id": None,
+            "leave_message": None,
+        }
+        db.set_leave_config(interaction.guild.id, None, None)
+        await interaction.response.send_message("🔕 Message de départ désactivé.", ephemeral=True)
+        return
+
+    message = message or "**{membre}** a quitté **{serveur}**. Nous sommes maintenant {nombre_membres} membres."
+
+    welcome_store[interaction.guild.id] = {
+        **welcome_store.get(interaction.guild.id, {}),
+        "leave_channel_id": salon.id,
+        "leave_message": message,
+    }
+    db.set_leave_config(interaction.guild.id, salon.id, message)
+
+    apercu = message.format(membre=str(interaction.user), serveur=interaction.guild.name, nombre_membres=interaction.guild.member_count)
+    embed = discord.Embed(
+        title="👋 Message de départ configuré",
+        description=f"Les départs seront annoncés dans {salon.mention} avec ce message :\n\n{apercu}",
+        color=get_premium_color(interaction.guild.id),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_footer(text="Variables disponibles : {membre}, {serveur}, {nombre_membres}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@premium_logs.error
+@premium_sanctions.error
+@premium_sanctions_retirer.error
+@premium_bienvenue.error
+@premium_depart.error
+async def premium_config_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        embed = discord.Embed(
+            title="⛔ Permission manquante",
+            description="Il faut la permission **Gérer le serveur** pour configurer les fonctionnalités Premium.",
+            color=discord.Color.red(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Une erreur est survenue : {error}", ephemeral=True)
+
+
 @premium_group.command(name="status", description="Vérifie si ce serveur profite du Premium")
 async def premium_status(interaction: discord.Interaction):
     if is_premium(interaction.guild.id):
@@ -1361,6 +1720,19 @@ async def premium_status(interaction: discord.Interaction):
         )
         embed.add_field(name="Activé par", value=activateur.mention if activateur else "Inconnu", inline=False)
         embed.add_field(name="Couleur actuelle", value=f"`#{data.get('color', 'FFD700')}`", inline=False)
+
+        logs_channel_id = mod_logs_store.get(interaction.guild.id)
+        logs_channel = interaction.guild.get_channel(logs_channel_id) if logs_channel_id else None
+        embed.add_field(name="Logs de modération", value=logs_channel.mention if logs_channel else "Non configurés", inline=True)
+
+        sanctions_config = auto_sanctions_store.get(interaction.guild.id, {})
+        embed.add_field(name="Sanctions automatiques", value=f"{len(sanctions_config)} configurée(s)" if sanctions_config else "Aucune", inline=True)
+
+        w_config = welcome_store.get(interaction.guild.id, {})
+        bienvenue_active = bool(w_config.get("welcome_channel_id"))
+        depart_active = bool(w_config.get("leave_channel_id"))
+        embed.add_field(name="Bienvenue / Départ", value=f"{'✅' if bienvenue_active else '❌'} Bienvenue — {'✅' if depart_active else '❌'} Départ", inline=True)
+
         embed.set_footer(text="Change-la avec /premium couleur")
         if interaction.guild.icon:
             embed.set_thumbnail(url=interaction.guild.icon.url)
@@ -1372,6 +1744,86 @@ async def premium_status(interaction: discord.Interaction):
         )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --- Bienvenue / Départ (Premium) ---
+# welcome_store : {guild_id: {welcome_channel_id, welcome_message, leave_channel_id, leave_message}}
+welcome_store = db.load_welcome_config()
+print(f"[DB] {len(welcome_store)} config(s) de bienvenue/départ chargée(s) depuis la base.")
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if not is_premium(member.guild.id):
+        return
+
+    config = welcome_store.get(member.guild.id)
+    if not config or not config.get("welcome_channel_id") or not config.get("welcome_message"):
+        return
+
+    channel = member.guild.get_channel(config["welcome_channel_id"])
+    if channel is None:
+        return
+
+    try:
+        texte = config["welcome_message"].format(
+            membre=member.mention,
+            serveur=member.guild.name,
+            nombre_membres=member.guild.member_count,
+        )
+    except (KeyError, IndexError):
+        texte = config["welcome_message"]
+
+    embed = discord.Embed(
+        title="👋 Nouveau membre !",
+        description=texte,
+        color=get_premium_color(member.guild.id),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"✨ Serveur Premium — {member.guild.member_count} membre(s)")
+
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    if not is_premium(member.guild.id):
+        return
+
+    config = welcome_store.get(member.guild.id)
+    if not config or not config.get("leave_channel_id") or not config.get("leave_message"):
+        return
+
+    channel = member.guild.get_channel(config["leave_channel_id"])
+    if channel is None:
+        return
+
+    try:
+        texte = config["leave_message"].format(
+            membre=str(member),
+            serveur=member.guild.name,
+            nombre_membres=member.guild.member_count,
+        )
+    except (KeyError, IndexError):
+        texte = config["leave_message"]
+
+    embed = discord.Embed(
+        title="👋 Départ d'un membre",
+        description=texte,
+        color=discord.Color.greyple(),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"✨ Serveur Premium — {member.guild.member_count} membre(s)")
+
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 # --- Commandes Owner ---
