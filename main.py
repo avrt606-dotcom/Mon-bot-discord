@@ -19,9 +19,117 @@ async def on_ready():
     except Exception as e:
         print(f"Erreur lors de la synchronisation des commandes : {e}")
 
+# Compteur de messages en mémoire : {user_id: nombre_de_messages}
+# Attention : Discord ne fournit pas d'historique global des messages via son API,
+# donc ce compteur ne comptabilise que les messages envoyés depuis le dernier
+# démarrage du bot (il repart à zéro à chaque redémarrage).
+message_count_store = {}
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if not message.author.bot:
+        message_count_store[message.author.id] = message_count_store.get(message.author.id, 0) + 1
+    await bot.process_commands(message)
+
+
+def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderateur: discord.Member = None, raison: str = None, extra_fields: list = None) -> discord.Embed:
+    """Embed uniforme utilisé par toutes les commandes de modération (mute, ban, kick, etc.)."""
+    embed = discord.Embed(
+        title=f"{emoji} {title}",
+        color=color,
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_author(name=str(cible), icon_url=cible.display_avatar.url)
+    embed.set_thumbnail(url=cible.display_avatar.url)
+
+    embed.add_field(name="Membre", value=cible.mention, inline=True)
+    if moderateur is not None:
+        embed.add_field(name="Modérateur", value=moderateur.mention, inline=True)
+    if extra_fields:
+        for name, value in extra_fields:
+            embed.add_field(name=name, value=value, inline=True)
+    if raison is not None:
+        embed.add_field(name="Raison", value=raison, inline=False)
+
+    embed.set_footer(text=f"ID : {cible.id}")
+    return embed
+
+
 @bot.tree.command(name="ping", description="Vérifie que le bot répond bien")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong ! Le bot fonctionne 🎉")
+    latence_ms = round(bot.latency * 1000)
+    embed = discord.Embed(
+        title="🏓 Pong !",
+        description="Le bot fonctionne parfaitement.",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.add_field(name="Latence", value=f"{latence_ms} ms", inline=True)
+    embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="info", description="Affiche toutes les informations d'un membre")
+@app_commands.describe(utilisateur="La personne à consulter (toi par défaut)")
+async def info(interaction: discord.Interaction, utilisateur: discord.Member = None):
+    utilisateur = utilisateur or interaction.user
+
+    couleur = utilisateur.color if utilisateur.color != discord.Color.default() else discord.Color.blurple()
+    embed = discord.Embed(
+        title=f"Informations sur {utilisateur.display_name}",
+        color=couleur,
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_author(name=str(utilisateur), icon_url=utilisateur.display_avatar.url)
+    embed.set_thumbnail(url=utilisateur.display_avatar.url)
+
+    embed.add_field(name="👤 Pseudo", value=str(utilisateur), inline=True)
+    embed.add_field(name="🆔 ID", value=str(utilisateur.id), inline=True)
+    embed.add_field(name="🤖 Bot", value="Oui" if utilisateur.bot else "Non", inline=True)
+
+    embed.add_field(
+        name="📅 Compte Discord créé le",
+        value=f"{discord.utils.format_dt(utilisateur.created_at, style='F')}\n{discord.utils.format_dt(utilisateur.created_at, style='R')}",
+        inline=False,
+    )
+
+    if utilisateur.joined_at:
+        embed.add_field(
+            name="📥 A rejoint le serveur le",
+            value=f"{discord.utils.format_dt(utilisateur.joined_at, style='F')}\n{discord.utils.format_dt(utilisateur.joined_at, style='R')}",
+            inline=False,
+        )
+
+    roles = [role.mention for role in reversed(utilisateur.roles) if role != interaction.guild.default_role]
+    roles_text = ", ".join(roles) if roles else "Aucun rôle"
+    if len(roles_text) > 1024:
+        roles_text = roles_text[:1000] + "…"
+    embed.add_field(name=f"🎭 Rôles ({len(roles)})", value=roles_text, inline=False)
+
+    if utilisateur.top_role != interaction.guild.default_role:
+        embed.add_field(name="👑 Rôle le plus élevé", value=utilisateur.top_role.mention, inline=True)
+
+    if utilisateur.premium_since:
+        embed.add_field(
+            name="💎 Booste le serveur depuis",
+            value=discord.utils.format_dt(utilisateur.premium_since, style="R"),
+            inline=True,
+        )
+
+    nb_warnings = len(warnings_store.get(utilisateur.id, []))
+    embed.add_field(name="⚠️ Avertissements", value=str(nb_warnings), inline=True)
+
+    nb_messages = message_count_store.get(utilisateur.id, 0)
+    embed.add_field(
+        name="💬 Messages envoyés",
+        value=f"{nb_messages} (comptés depuis le dernier redémarrage du bot)",
+        inline=True,
+    )
+
+    embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
+
+    await interaction.response.send_message(embed=embed)
 
 
 def parse_duration(duration_str: str):
@@ -108,9 +216,12 @@ async def mute(interaction: discord.Interaction, utilisateur: discord.Member, du
 
     duree_lisible = format_duration(seconds)
 
-    await interaction.response.send_message(
-        f"{utilisateur.mention} a été mute par {interaction.user.mention} pour {duree_lisible}. Raison : {raison}"
+    embed = build_mod_embed(
+        "🔇", "Membre mute", discord.Color.orange(),
+        utilisateur, interaction.user, raison,
+        extra_fields=[("Durée", duree_lisible)],
     )
+    await interaction.response.send_message(embed=embed)
 
     # Tentative d'envoi d'un MP à la personne mutée
     try:
@@ -138,7 +249,8 @@ async def demute(interaction: discord.Interaction, utilisateur: discord.Member, 
         )
         return
 
-    await interaction.response.send_message(f"{utilisateur.mention} a été démute !")
+    embed = build_mod_embed("🔊", "Membre démute", discord.Color.green(), utilisateur, interaction.user, raison)
+    await interaction.response.send_message(embed=embed)
 
     try:
         await utilisateur.send(f"Tu as été démute par {interaction.user.mention}. Raison : {raison}")
@@ -295,9 +407,8 @@ async def ban(interaction: discord.Interaction, utilisateur: discord.Member, rai
         )
         return
 
-    await interaction.response.send_message(
-        f"{utilisateur.mention} a été banni par {interaction.user.mention}. Raison : {raison}"
-    )
+    embed = build_mod_embed("🔨", "Membre banni", discord.Color.red(), utilisateur, interaction.user, raison)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="unban", description="Débannit un membre via son ID")
@@ -332,9 +443,8 @@ async def unban(interaction: discord.Interaction, user_id: str, raison: str = "A
         )
         return
 
-    await interaction.response.send_message(
-        f"{user.mention} a été débanni par {interaction.user.mention}. Raison : {raison}"
-    )
+    embed = build_mod_embed("♻️", "Membre débanni", discord.Color.green(), user, interaction.user, raison)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="kick", description="Expulse un membre du serveur")
@@ -360,9 +470,8 @@ async def kick(interaction: discord.Interaction, utilisateur: discord.Member, ra
         )
         return
 
-    await interaction.response.send_message(
-        f"{utilisateur.mention} a été expulsé par {interaction.user.mention}. Raison : {raison}"
-    )
+    embed = build_mod_embed("👢", "Membre expulsé", discord.Color.orange(), utilisateur, interaction.user, raison)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="warn", description="Donne un avertissement à un membre")
@@ -407,9 +516,8 @@ async def warnings_cmd(interaction: discord.Interaction, utilisateur: discord.Me
 @app_commands.checks.has_permissions(moderate_members=True)
 async def clearwarnings(interaction: discord.Interaction, utilisateur: discord.Member):
     warnings_store[utilisateur.id] = []
-    await interaction.response.send_message(
-        f"Tous les avertissements de {utilisateur.mention} ont été effacés."
-    )
+    embed = build_mod_embed("🧹", "Avertissements effacés", discord.Color.green(), utilisateur, interaction.user)
+    await interaction.response.send_message(embed=embed)
 
 
 @ban.error
