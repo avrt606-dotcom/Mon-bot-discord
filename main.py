@@ -47,6 +47,50 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+# --- Système Owners du bot ---
+# bot_owners_store : {user_id: {"added_by": int, "added_at": str}}
+# Un owner ajouté ici peut utiliser toutes les commandes de modération sur n'importe quel
+# serveur où le bot est présent, sans avoir besoin des permissions Discord habituelles.
+# Seul le vrai propriétaire du bot (celui du compte développeur Discord) peut gérer
+# cette liste et utiliser /premium generer.
+bot_owners_store = db.load_bot_owners()
+print(f"[DB] {len(bot_owners_store)} owner(s) additionnel(s) chargé(s) depuis la base.")
+
+
+async def is_added_owner(user_id: int) -> bool:
+    return user_id in bot_owners_store
+
+
+async def is_full_owner(user: discord.abc.User) -> bool:
+    """Vrai uniquement pour le propriétaire réel du bot (l'app Discord elle-même)."""
+    return await bot.is_owner(user)
+
+
+async def is_owner_level(user: discord.abc.User) -> bool:
+    """Vrai pour le propriétaire réel OU un owner ajouté via /owner add."""
+    if await bot.is_owner(user):
+        return True
+    return await is_added_owner(user.id)
+
+
+def has_permissions_or_owner(**perms):
+    """Comme app_commands.checks.has_permissions, mais laisse passer automatiquement
+    le propriétaire réel du bot et les owners ajoutés via /owner add, même sans les
+    permissions Discord normalement requises."""
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if await is_owner_level(interaction.user):
+            return True
+
+        resolved = interaction.permissions if interaction.permissions is not None else interaction.user.guild_permissions
+        missing = [perm for perm, value in perms.items() if getattr(resolved, perm, None) != value]
+        if not missing:
+            return True
+        raise app_commands.MissingPermissions(missing)
+
+    return app_commands.check(predicate)
+
+
 # --- Système Premium ---
 # premium_servers : {guild_id: {"activated_by": user_id, "activated_at": datetime, "code": str}}
 # premium_codes   : {code: {"generated_by", "assigned_to", "used", "used_by", "used_in_guild", "generated_at"}}
@@ -93,9 +137,10 @@ def generate_premium_code() -> str:
     )
 
 
-def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderateur: discord.Member = None, raison: str = None, extra_fields: list = None, guild: discord.Guild = None) -> discord.Embed:
+def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderateur: discord.Member = None, raison: str = None, extra_fields: list = None, guild: discord.Guild = None, owner_badge: bool = False) -> discord.Embed:
     """Embed uniforme utilisé par toutes les commandes de modération (mute, ban, kick, etc.).
-    Si le serveur est Premium, l'embed passe en doré avec un badge ✨."""
+    Si le serveur est Premium, l'embed passe en doré avec un badge ✨.
+    Si l'action a été faite par un Owner du bot, un badge 👑 apparaît en pied de page."""
     premium = guild is not None and is_premium(guild.id)
     if premium:
         color = get_premium_color(guild.id)
@@ -118,6 +163,8 @@ def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderat
         embed.add_field(name="Raison", value=raison, inline=False)
 
     footer = f"ID : {cible.id}"
+    if owner_badge:
+        footer = f"👑 Action Owner — {footer}"
     if premium:
         footer = f"✨ Serveur Premium — {footer}"
     embed.set_footer(text=footer)
@@ -195,6 +242,9 @@ async def info(interaction: discord.Interaction, utilisateur: discord.Member = N
         inline=True,
     )
 
+    if await is_owner_level(utilisateur):
+        embed.add_field(name="👑 Owner du bot", value="Oui", inline=True)
+
     footer_text = f"Demandé par {interaction.user}"
     if is_premium(interaction.guild.id):
         footer_text = f"✨ Serveur Premium — {footer_text}"
@@ -255,7 +305,7 @@ def format_duration(seconds: int) -> str:
     duree="La durée du mute, ex: 10m, 1h, 1j",
     raison="La raison du mute",
 )
-@app_commands.checks.has_permissions(moderate_members=True)
+@has_permissions_or_owner(moderate_members=True)
 async def mute(interaction: discord.Interaction, utilisateur: discord.Member, duree: str, raison: str = "Aucune raison fournie"):
     seconds = parse_duration(duree)
 
@@ -309,6 +359,7 @@ async def mute(interaction: discord.Interaction, utilisateur: discord.Member, du
         utilisateur, interaction.user, raison,
         extra_fields=[("Durée", duree_lisible)],
         guild=interaction.guild,
+        owner_badge=await is_owner_level(interaction.user),
     )
     await interaction.response.send_message(embed=embed)
 
@@ -327,7 +378,7 @@ async def mute(interaction: discord.Interaction, utilisateur: discord.Member, du
     utilisateur="La personne à démute",
     raison="La raison du démute",
 )
-@app_commands.checks.has_permissions(moderate_members=True)
+@has_permissions_or_owner(moderate_members=True)
 async def demute(interaction: discord.Interaction, utilisateur: discord.Member, raison: str = "Aucune raison fournie"):
     try:
         await utilisateur.timeout(None, reason=raison)
@@ -338,7 +389,7 @@ async def demute(interaction: discord.Interaction, utilisateur: discord.Member, 
         )
         return
 
-    embed = build_mod_embed("🔊", "Membre démute", discord.Color.green(), utilisateur, interaction.user, raison, guild=interaction.guild)
+    embed = build_mod_embed("🔊", "Membre démute", discord.Color.green(), utilisateur, interaction.user, raison, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
 
     try:
@@ -480,7 +531,7 @@ class WarningDeleteView(discord.ui.View):
     utilisateur="La personne à bannir",
     raison="La raison du bannissement",
 )
-@app_commands.checks.has_permissions(ban_members=True)
+@has_permissions_or_owner(ban_members=True)
 async def ban(interaction: discord.Interaction, utilisateur: discord.Member, raison: str = "Aucune raison fournie"):
     try:
         await utilisateur.send(
@@ -498,7 +549,7 @@ async def ban(interaction: discord.Interaction, utilisateur: discord.Member, rai
         )
         return
 
-    embed = build_mod_embed("🔨", "Membre banni", discord.Color.red(), utilisateur, interaction.user, raison, guild=interaction.guild)
+    embed = build_mod_embed("🔨", "Membre banni", discord.Color.red(), utilisateur, interaction.user, raison, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
 
 
@@ -507,7 +558,7 @@ async def ban(interaction: discord.Interaction, utilisateur: discord.Member, rai
     user_id="L'ID de la personne à débannir",
     raison="La raison du débannissement",
 )
-@app_commands.checks.has_permissions(ban_members=True)
+@has_permissions_or_owner(ban_members=True)
 async def unban(interaction: discord.Interaction, user_id: str, raison: str = "Aucune raison fournie"):
     try:
         user_id_int = int(user_id)
@@ -534,7 +585,7 @@ async def unban(interaction: discord.Interaction, user_id: str, raison: str = "A
         )
         return
 
-    embed = build_mod_embed("♻️", "Membre débanni", discord.Color.green(), user, interaction.user, raison, guild=interaction.guild)
+    embed = build_mod_embed("♻️", "Membre débanni", discord.Color.green(), user, interaction.user, raison, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
 
 
@@ -543,7 +594,7 @@ async def unban(interaction: discord.Interaction, user_id: str, raison: str = "A
     utilisateur="La personne à expulser",
     raison="La raison de l'expulsion",
 )
-@app_commands.checks.has_permissions(kick_members=True)
+@has_permissions_or_owner(kick_members=True)
 async def kick(interaction: discord.Interaction, utilisateur: discord.Member, raison: str = "Aucune raison fournie"):
     try:
         await utilisateur.send(
@@ -561,7 +612,7 @@ async def kick(interaction: discord.Interaction, utilisateur: discord.Member, ra
         )
         return
 
-    embed = build_mod_embed("👢", "Membre expulsé", discord.Color.orange(), utilisateur, interaction.user, raison, guild=interaction.guild)
+    embed = build_mod_embed("👢", "Membre expulsé", discord.Color.orange(), utilisateur, interaction.user, raison, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
 
 
@@ -570,7 +621,7 @@ async def kick(interaction: discord.Interaction, utilisateur: discord.Member, ra
     utilisateur="La personne à avertir",
     raison="La raison de l'avertissement",
 )
-@app_commands.checks.has_permissions(moderate_members=True)
+@has_permissions_or_owner(moderate_members=True)
 async def warn(interaction: discord.Interaction, utilisateur: discord.Member, raison: str = "Aucune raison fournie"):
     timestamp = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
     warning_id = db.add_warning(utilisateur.id, interaction.user.mention, raison, timestamp)
@@ -596,7 +647,7 @@ async def warn(interaction: discord.Interaction, utilisateur: discord.Member, ra
 
 @bot.tree.command(name="warnings", description="Affiche les avertissements d'un membre")
 @app_commands.describe(utilisateur="La personne dont tu veux voir les avertissements")
-@app_commands.checks.has_permissions(moderate_members=True)
+@has_permissions_or_owner(moderate_members=True)
 async def warnings_cmd(interaction: discord.Interaction, utilisateur: discord.Member):
     user_warnings = warnings_store.get(utilisateur.id, [])
 
@@ -608,11 +659,11 @@ async def warnings_cmd(interaction: discord.Interaction, utilisateur: discord.Me
 
 @bot.tree.command(name="clearwarnings", description="Efface tous les avertissements d'un membre")
 @app_commands.describe(utilisateur="La personne dont tu veux effacer les avertissements")
-@app_commands.checks.has_permissions(moderate_members=True)
+@has_permissions_or_owner(moderate_members=True)
 async def clearwarnings(interaction: discord.Interaction, utilisateur: discord.Member):
     warnings_store[utilisateur.id] = []
     db.clear_warnings(utilisateur.id)
-    embed = build_mod_embed("🧹", "Avertissements effacés", discord.Color.green(), utilisateur, interaction.user, guild=interaction.guild)
+    embed = build_mod_embed("🧹", "Avertissements effacés", discord.Color.green(), utilisateur, interaction.user, guild=interaction.guild, owner_badge=await is_owner_level(interaction.user))
     await interaction.response.send_message(embed=embed)
 
 
@@ -709,7 +760,9 @@ bot.tree.add_command(premium_group)
 @premium_group.command(name="generer", description="[Propriétaire uniquement] Génère un code Premium et l'envoie en MP")
 @app_commands.describe(utilisateur="La personne à qui envoyer le code Premium")
 async def premium_generer(interaction: discord.Interaction, utilisateur: discord.User):
-    if not await bot.is_owner(interaction.user):
+    # Volontairement limité au SEUL vrai propriétaire du bot : ni les owners ajoutés
+    # via /owner add, ni personne d'autre, ne peuvent générer de codes Premium.
+    if not await is_full_owner(interaction.user):
         embed = discord.Embed(
             title="⛔ Accès refusé",
             description="Seul le propriétaire du bot peut générer des codes Premium.",
@@ -819,7 +872,7 @@ async def premium_activer(interaction: discord.Interaction, code: str):
 
 @premium_group.command(name="couleur", description="[Premium] Choisis la couleur des embeds du bot sur ce serveur")
 @app_commands.describe(couleur="Optionnel : code hex personnalisé (ex: #FF5733). Laisse vide pour choisir une couleur prédéfinie.")
-@app_commands.checks.has_permissions(manage_guild=True)
+@has_permissions_or_owner(manage_guild=True)
 async def premium_couleur(interaction: discord.Interaction, couleur: str = None):
     if not is_premium(interaction.guild.id):
         embed = discord.Embed(
@@ -913,6 +966,136 @@ async def premium_status(interaction: discord.Interaction):
             color=discord.Color.greyple(),
         )
 
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --- Commandes Owner ---
+# Réservées au SEUL vrai propriétaire du bot : lui seul peut ajouter, retirer ou lister
+# les owners. Un owner ajouté ne peut pas gérer d'autres owners, ni générer de Premium.
+owner_group = app_commands.Group(name="owner", description="Gestion des owners du bot (propriétaire uniquement)")
+bot.tree.add_command(owner_group)
+
+
+def build_access_denied_embed() -> discord.Embed:
+    return discord.Embed(
+        title="⛔ Accès refusé",
+        description="Seul le propriétaire du bot peut gérer les owners.",
+        color=discord.Color.red(),
+    )
+
+
+@owner_group.command(name="add", description="[Propriétaire uniquement] Ajoute un owner du bot")
+@app_commands.describe(utilisateur="La personne à promouvoir owner du bot")
+async def owner_add(interaction: discord.Interaction, utilisateur: discord.User):
+    if not await is_full_owner(interaction.user):
+        await interaction.response.send_message(embed=build_access_denied_embed(), ephemeral=True)
+        return
+
+    if await bot.is_owner(utilisateur):
+        embed = discord.Embed(
+            title="✨ Déjà propriétaire",
+            description=f"{utilisateur.mention} est déjà le propriétaire du bot.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if utilisateur.id in bot_owners_store:
+        embed = discord.Embed(
+            title="👑 Déjà owner",
+            description=f"{utilisateur.mention} est déjà un owner du bot.",
+            color=discord.Color.greyple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    added_at = datetime.datetime.now()
+    bot_owners_store[utilisateur.id] = {"added_by": interaction.user.id, "added_at": added_at.isoformat()}
+    db.add_bot_owner(utilisateur.id, interaction.user.id, added_at.isoformat())
+
+    embed = discord.Embed(
+        title="👑 Nouvel owner ajouté !",
+        description=f"{utilisateur.mention} est désormais **owner du bot**.",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_thumbnail(url=utilisateur.display_avatar.url)
+    embed.add_field(
+        name="✅ Peut faire",
+        value="Toutes les commandes de modération (`/mute`, `/ban`, `/kick`, `/warn`, ...) sur **n'importe quel serveur** où le bot est présent, sans avoir besoin des permissions Discord habituelles.",
+        inline=False,
+    )
+    embed.add_field(
+        name="❌ Ne peut pas faire",
+        value="`/premium generer` et `/owner add|remove` restent réservées au propriétaire réel du bot.",
+        inline=False,
+    )
+    embed.set_footer(text=f"Ajouté par {interaction.user}")
+    await interaction.response.send_message(embed=embed)
+
+    try:
+        dm_embed = discord.Embed(
+            title="👑 Tu es maintenant owner du bot !",
+            description="Tu peux désormais utiliser toutes les commandes de modération sur n'importe quel serveur où le bot est présent.",
+            color=discord.Color.gold(),
+        )
+        await utilisateur.send(embed=dm_embed)
+    except discord.Forbidden:
+        pass
+
+
+@owner_group.command(name="remove", description="[Propriétaire uniquement] Retire un owner du bot")
+@app_commands.describe(utilisateur="La personne à retirer des owners du bot")
+async def owner_remove(interaction: discord.Interaction, utilisateur: discord.User):
+    if not await is_full_owner(interaction.user):
+        await interaction.response.send_message(embed=build_access_denied_embed(), ephemeral=True)
+        return
+
+    if utilisateur.id not in bot_owners_store:
+        embed = discord.Embed(
+            title="❌ Pas owner",
+            description=f"{utilisateur.mention} n'est pas owner du bot.",
+            color=discord.Color.red(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    del bot_owners_store[utilisateur.id]
+    db.remove_bot_owner(utilisateur.id)
+
+    embed = discord.Embed(
+        title="🗑️ Owner retiré",
+        description=f"{utilisateur.mention} n'est plus owner du bot.",
+        color=discord.Color.orange(),
+        timestamp=datetime.datetime.now(),
+    )
+    embed.set_thumbnail(url=utilisateur.display_avatar.url)
+    embed.set_footer(text=f"Retiré par {interaction.user}")
+    await interaction.response.send_message(embed=embed)
+
+
+@owner_group.command(name="list", description="[Propriétaire uniquement] Liste tous les owners du bot")
+async def owner_list(interaction: discord.Interaction):
+    if not await is_full_owner(interaction.user):
+        await interaction.response.send_message(embed=build_access_denied_embed(), ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="👑 Owners du bot",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(),
+    )
+
+    if not bot_owners_store:
+        embed.description = "Aucun owner additionnel n'a été ajouté pour le moment."
+    else:
+        lignes = []
+        for user_id, data in bot_owners_store.items():
+            ajoute_le = datetime.datetime.fromisoformat(data["added_at"])
+            lignes.append(f"<@{user_id}> — ajouté {discord.utils.format_dt(ajoute_le, style='R')}")
+        embed.description = "\n".join(lignes)
+
+    embed.set_footer(text=f"{len(bot_owners_store)} owner(s) additionnel(s)")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
