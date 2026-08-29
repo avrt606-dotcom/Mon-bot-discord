@@ -1,7 +1,7 @@
 """
 database.py — Gère la sauvegarde des données du bot (avertissements, Premium,
 compteur de messages) dans une base SQLite locale (bot_data.db), pour que
-rien ne soit perdu si le bot redémarre ou plante.
+rien ne soit perdu si le bot redémarre ou plante
 
 Ce fichier doit rester dans le même dossier que main.py.
 """
