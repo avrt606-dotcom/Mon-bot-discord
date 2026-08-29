@@ -104,16 +104,28 @@ def init_db():
         )
     """)
 
-    # --- Nouveau : message de bienvenue / départ personnalisé par serveur (Premium) ---
+    # --- Nouveau : message de bienvenue / départ par serveur ---
+    # Accessible à tous les serveurs (salon + message par défaut). Les serveurs Premium
+    # peuvent en plus personnaliser le texte du message et ajouter une image/bannière
+    # (welcome_image_url / leave_image_url).
     cur.execute("""
         CREATE TABLE IF NOT EXISTS welcome_config (
             guild_id INTEGER PRIMARY KEY,
             welcome_channel_id INTEGER,
             welcome_message TEXT,
+            welcome_image_url TEXT,
             leave_channel_id INTEGER,
-            leave_message TEXT
+            leave_message TEXT,
+            leave_image_url TEXT
         )
     """)
+
+    # Migration : ajoute les colonnes image si la base existait déjà avant cette fonctionnalité.
+    for colonne in ("welcome_image_url", "leave_image_url"):
+        try:
+            cur.execute(f"ALTER TABLE welcome_config ADD COLUMN {colonne} TEXT")
+        except sqlite3.OperationalError:
+            pass  # la colonne existe déjà
 
     conn.commit()
     conn.close()
@@ -396,14 +408,18 @@ def remove_auto_sanctions_config(guild_id: int):
     conn.close()
 
 
-# --- Message de bienvenue / départ (Premium) ---
+# --- Message de bienvenue / départ ---
+# Disponible pour tous les serveurs (salon + message par défaut, sans image).
+# Les serveurs Premium peuvent en plus personnaliser le texte et ajouter une image.
 
 def load_welcome_config() -> dict:
-    """Retourne {guild_id: {welcome_channel_id, welcome_message, leave_channel_id, leave_message}}"""
+    """Retourne {guild_id: {welcome_channel_id, welcome_message, welcome_image_url,
+    leave_channel_id, leave_message, leave_image_url}}"""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT guild_id, welcome_channel_id, welcome_message, leave_channel_id, leave_message FROM welcome_config"
+        "SELECT guild_id, welcome_channel_id, welcome_message, welcome_image_url, "
+        "leave_channel_id, leave_message, leave_image_url FROM welcome_config"
     )
     rows = cur.fetchall()
     conn.close()
@@ -412,8 +428,10 @@ def load_welcome_config() -> dict:
         row["guild_id"]: {
             "welcome_channel_id": row["welcome_channel_id"],
             "welcome_message": row["welcome_message"],
+            "welcome_image_url": row["welcome_image_url"],
             "leave_channel_id": row["leave_channel_id"],
             "leave_message": row["leave_message"],
+            "leave_image_url": row["leave_image_url"],
         }
         for row in rows
     }
@@ -426,37 +444,40 @@ def _get_or_create_welcome_row(guild_id: int) -> dict:
     row = cur.fetchone()
     if row is None:
         cur.execute(
-            "INSERT INTO welcome_config (guild_id, welcome_channel_id, welcome_message, leave_channel_id, leave_message) "
-            "VALUES (?, NULL, NULL, NULL, NULL)",
+            "INSERT INTO welcome_config (guild_id, welcome_channel_id, welcome_message, welcome_image_url, "
+            "leave_channel_id, leave_message, leave_image_url) VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL)",
             (guild_id,),
         )
         conn.commit()
-        data = {"welcome_channel_id": None, "welcome_message": None, "leave_channel_id": None, "leave_message": None}
+        data = {
+            "welcome_channel_id": None, "welcome_message": None, "welcome_image_url": None,
+            "leave_channel_id": None, "leave_message": None, "leave_image_url": None,
+        }
     else:
         data = dict(row)
     conn.close()
     return data
 
 
-def set_welcome_config(guild_id: int, channel_id: int, message: str):
+def set_welcome_config(guild_id: int, channel_id: int, message: str, image_url: str = None):
     _get_or_create_welcome_row(guild_id)
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE welcome_config SET welcome_channel_id = ?, welcome_message = ? WHERE guild_id = ?",
-        (channel_id, message, guild_id),
+        "UPDATE welcome_config SET welcome_channel_id = ?, welcome_message = ?, welcome_image_url = ? WHERE guild_id = ?",
+        (channel_id, message, image_url, guild_id),
     )
     conn.commit()
     conn.close()
 
 
-def set_leave_config(guild_id: int, channel_id: int, message: str):
+def set_leave_config(guild_id: int, channel_id: int, message: str, image_url: str = None):
     _get_or_create_welcome_row(guild_id)
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE welcome_config SET leave_channel_id = ?, leave_message = ? WHERE guild_id = ?",
-        (channel_id, message, guild_id),
+        "UPDATE welcome_config SET leave_channel_id = ?, leave_message = ?, leave_image_url = ? WHERE guild_id = ?",
+        (channel_id, message, image_url, guild_id),
     )
     conn.commit()
     conn.close()
