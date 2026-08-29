@@ -7,7 +7,10 @@ import datetime
 import database as db
 
 # Initialise la base SQLite (crée bot_data.db et ses tables si besoin)
+fichier_existait_deja = os.path.exists(db.DB_PATH)
 db.init_db()
+print(f"[DB] Base de données utilisée : {db.DB_PATH}")
+print(f"[DB] Le fichier existait déjà avant ce lancement : {fichier_existait_deja}")
 
 # Les "intents" définissent quelles infos le bot peut recevoir de Discord
 intents = discord.Intents.default()
@@ -29,6 +32,7 @@ async def on_ready():
 # Compteur de messages : {user_id: nombre_de_messages}, chargé depuis la base SQLite
 # et sauvegardé automatiquement toutes les 5 minutes (voir save_message_counts_task).
 message_count_store = db.load_message_counts()
+print(f"[DB] {len(message_count_store)} compteur(s) de messages chargé(s) depuis la base.")
 
 
 @tasks.loop(minutes=5)
@@ -49,6 +53,8 @@ async def on_message(message: discord.Message):
 # Chargés depuis la base SQLite au démarrage, et écrits dans la base à chaque changement.
 premium_servers = db.load_premium_servers()
 premium_codes = db.load_premium_codes()
+print(f"[DB] {len(premium_servers)} serveur(s) premium chargé(s) depuis la base.")
+print(f"[DB] {len(premium_codes)} code(s) premium chargé(s) depuis la base.")
 
 
 def is_premium(guild_id: int) -> bool:
@@ -359,6 +365,7 @@ async def mute_demute_error(interaction: discord.Interaction, error):
 # Stockage des avertissements : {user_id: [ {id, moderator, reason, timestamp}, ... ]}
 # Chargé depuis la base SQLite au démarrage, et écrit dans la base à chaque changement.
 warnings_store = db.load_warnings()
+print(f"[DB] {len(warnings_store)} membre(s) avec des avertissements chargé(s) depuis la base.")
 
 
 def build_warn_notification_embed(utilisateur: discord.Member, moderateur: discord.Member, raison: str, total: int) -> discord.Embed:
