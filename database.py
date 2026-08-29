@@ -10,7 +10,15 @@ import sqlite3
 import os
 import datetime
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
+# Sur Railway, une fois qu'un Volume est attaché au service, Railway définit
+# automatiquement la variable d'environnement RAILWAY_VOLUME_MOUNT_PATH avec
+# le chemin du dossier persistant (ex: /data). On l'utilise si elle existe,
+# sinon (en local, ou sans volume) on garde le dossier du script comme avant.
+_volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+if _volume_path:
+    DB_PATH = os.path.join(_volume_path, "bot_data.db")
+else:
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
 
 
 def get_connection():
