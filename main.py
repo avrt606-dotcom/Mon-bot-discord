@@ -195,30 +195,31 @@ async def ping(interaction: discord.Interaction):
     embed.add_field(name="Latence", value=f"{latence_ms} ms", inline=True)
     embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
-
+    
 @bot.tree.command(name="ia", description="Pose une question à l'IA et obtiens une réponse")
 @app_commands.describe(question="Ta question pour l'IA")
 async def ia(interaction: discord.Interaction, question: str):
     await interaction.response.defer()
 
-    texte_reponse = None
-    derniere_erreur = None
+    def appel_gemini():
+        reponse = ia_client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=question,
+        )
+        return reponse.text
 
+    texte_reponse = None
     for tentative in range(3):
         try:
-            reponse = ia_client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=question,
-            )
-            texte_reponse = reponse.text
+            texte_reponse = await asyncio.to_thread(appel_gemini)
             break
         except Exception as e:
-            derniere_erreur = e
             if "503" in str(e) or "UNAVAILABLE" in str(e):
-                await asyncio.sleep(2 * (tentative + 1))  # attend un peu plus longtemps à chaque essai
+                await asyncio.sleep(2 * (tentative + 1))
                 continue
             else:
-                break  # autre type d'erreur, inutile de réessayer
+                await interaction.followup.send(f"Erreur lors de la génération de la réponse : {e}")
+                return
 
     if texte_reponse is None:
         await interaction.followup.send(
@@ -239,7 +240,6 @@ async def ia(interaction: discord.Interaction, question: str):
     embed.add_field(name="Question", value=question[:1024], inline=False)
     embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
     await interaction.followup.send(embed=embed)
-
 
 @bot.tree.command(name="help", description="Affiche la liste de toutes les commandes du bot")
 async def help_cmd(interaction: discord.Interaction):
