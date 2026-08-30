@@ -7,6 +7,7 @@ import datetime
 
 import database as db
 from google import genai
+import asyncio
 
 # Initialise la base SQLite (crée bot_data.db et ses tables si besoin)
 fichier_existait_deja = os.path.exists(db.DB_PATH)
@@ -195,20 +196,34 @@ async def ping(interaction: discord.Interaction):
     embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="ia", description="Pose une question à l'IA et obtiens une réponse")
 @app_commands.describe(question="Ta question pour l'IA")
 async def ia(interaction: discord.Interaction, question: str):
     await interaction.response.defer()
 
-    try:
-        reponse = ia_client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=question,
+    texte_reponse = None
+    derniere_erreur = None
+
+    for tentative in range(3):
+        try:
+            reponse = ia_client.models.generate_content(
+                model="gemini-flash-latest",
+                contents=question,
+            )
+            texte_reponse = reponse.text
+            break
+        except Exception as e:
+            derniere_erreur = e
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                await asyncio.sleep(2 * (tentative + 1))  # attend un peu plus longtemps à chaque essai
+                continue
+            else:
+                break  # autre type d'erreur, inutile de réessayer
+
+    if texte_reponse is None:
+        await interaction.followup.send(
+            "😔 L'IA est surchargée en ce moment (trop de demandes chez Google). Réessaie dans une minute !"
         )
-        texte_reponse = reponse.text
-    except Exception as e:
-        await interaction.followup.send(f"Erreur lors de la génération de la réponse : {e}")
         return
 
     if len(texte_reponse) > 4000:
