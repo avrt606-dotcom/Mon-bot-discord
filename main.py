@@ -224,6 +224,36 @@ async def ping(interaction: discord.Interaction):
     embed.add_field(name="Latence", value=f"{latence_ms} ms", inline=True)
     embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
+    @bot.tree.command(name="ia", description="Pose une question à l'IA et obtiens une réponse")
+@app_commands.describe(question="Ta question pour l'IA")
+async def ia(interaction: discord.Interaction, question: str):
+    await interaction.response.defer()  # l'IA peut mettre quelques secondes à répondre
+
+    try:
+        reponse = ia_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": question}],
+        )
+        texte_reponse = reponse.content[0].text
+    except Exception as e:
+        await interaction.followup.send(f"Erreur lors de la génération de la réponse : {e}")
+        return
+
+    # Discord limite un embed à 4096 caractères, on coupe si besoin
+    if len(texte_reponse) > 4000:
+        texte_reponse = texte_reponse[:4000] + "…"
+
+    couleur = get_premium_color(interaction.guild.id) if is_premium(interaction.guild.id) else discord.Color.blurple()
+    embed = discord.Embed(
+        title="🤖 Réponse de l'IA",
+        description=texte_reponse,
+        color=couleur,
+        timestamp=datetime.datetime.now(),
+    )
+    embed.add_field(name="Question", value=question[:1024], inline=False)
+    embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="help", description="Affiche la liste de toutes les commandes du bot")
