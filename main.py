@@ -6,6 +6,7 @@ import random
 import datetime
 
 import database as db
+from anthropic import Anthropic
 
 # Initialise la base SQLite (crée bot_data.db et ses tables si besoin)
 fichier_existait_deja = os.path.exists(db.DB_PATH)
