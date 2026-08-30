@@ -6,7 +6,7 @@ import random
 import datetime
 
 import database as db
-from anthropic import Anthropic
+from google import genai
 
 # Initialise la base SQLite (crée bot_data.db et ses tables si besoin)
 fichier_existait_deja = os.path.exists(db.DB_PATH)
@@ -20,7 +20,9 @@ intents.message_content = True
 intents.members = True  # nécessaire pour on_member_join / on_member_remove (bienvenue-départ)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-ia_client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+# Client Gemini (gratuit) pour la commande /ia
+ia_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 @bot.event
 async def on_ready():
@@ -30,8 +32,6 @@ async def on_ready():
     if not check_giveaways_task.is_running():
         check_giveaways_task.start()
 
-    # Réattache les boutons "Participer" de tous les giveaways encore actifs,
-    # pour qu'ils continuent à fonctionner après un redémarrage/redéploiement.
     giveaways_actifs = db.load_active_giveaways()
     for giveaway in giveaways_actifs:
         bot.add_view(GiveawayView(giveaway["id"]))
@@ -43,8 +43,6 @@ async def on_ready():
     except Exception as e:
         print(f"Erreur lors de la synchronisation des commandes : {e}")
 
-# Compteur de messages : {user_id: nombre_de_messages}, chargé depuis la base SQLite
-# et sauvegardé automatiquement toutes les 5 minutes (voir save_message_counts_task).
 message_count_store = db.load_message_counts()
 print(f"[DB] {len(message_count_store)} compteur(s) de messages chargé(s) depuis la base.")
 
@@ -61,12 +59,6 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-# --- Système Owners du bot ---
-# bot_owners_store : {user_id: {"added_by": int, "added_at": str}}
-# Un owner ajouté ici peut utiliser toutes les commandes de modération sur n'importe quel
-# serveur où le bot est présent, sans avoir besoin des permissions Discord habituelles.
-# Seul le vrai propriétaire du bot (celui du compte développeur Discord) peut gérer
-# cette liste et utiliser /premium generer.
 bot_owners_store = db.load_bot_owners()
 print(f"[DB] {len(bot_owners_store)} owner(s) additionnel(s) chargé(s) depuis la base.")
 
@@ -76,22 +68,16 @@ async def is_added_owner(user_id: int) -> bool:
 
 
 async def is_full_owner(user: discord.abc.User) -> bool:
-    """Vrai uniquement pour le propriétaire réel du bot (l'app Discord elle-même)."""
     return await bot.is_owner(user)
 
 
 async def is_owner_level(user: discord.abc.User) -> bool:
-    """Vrai pour le propriétaire réel OU un owner ajouté via /owner add."""
     if await bot.is_owner(user):
         return True
     return await is_added_owner(user.id)
 
 
 def has_permissions_or_owner(**perms):
-    """Comme app_commands.checks.has_permissions, mais laisse passer automatiquement
-    le propriétaire réel du bot et les owners ajoutés via /owner add, même sans les
-    permissions Discord normalement requises."""
-
     async def predicate(interaction: discord.Interaction) -> bool:
         if await is_owner_level(interaction.user):
             return True
@@ -105,10 +91,6 @@ def has_permissions_or_owner(**perms):
     return app_commands.check(predicate)
 
 
-# --- Système Premium ---
-# premium_servers : {guild_id: {"activated_by": user_id, "activated_at": datetime, "code": str}}
-# premium_codes   : {code: {"generated_by", "assigned_to", "used", "used_by", "used_in_guild", "generated_at"}}
-# Chargés depuis la base SQLite au démarrage, et écrits dans la base à chaque changement.
 premium_servers = db.load_premium_servers()
 premium_codes = db.load_premium_codes()
 print(f"[DB] {len(premium_servers)} serveur(s) premium chargé(s) depuis la base.")
@@ -120,7 +102,6 @@ def is_premium(guild_id: int) -> bool:
 
 
 def get_premium_color(guild_id: int) -> discord.Color:
-    """Retourne la couleur choisie par le serveur premium, ou doré par défaut."""
     data = premium_servers.get(guild_id)
     hex_value = data["color"] if data else "FFD700"
     try:
@@ -130,8 +111,6 @@ def get_premium_color(guild_id: int) -> discord.Color:
 
 
 def parse_hex_color(texte: str):
-    """Valide et convertit un texte comme '#FF5733' ou 'ff5733' en code hex propre (6 caractères).
-    Retourne None si le format est invalide."""
     texte = texte.strip().lstrip("#").upper()
     if len(texte) != 6:
         return None
@@ -151,9 +130,6 @@ def generate_premium_code() -> str:
 
 
 def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderateur: discord.Member = None, raison: str = None, extra_fields: list = None, guild: discord.Guild = None, owner_badge: bool = False) -> discord.Embed:
-    """Embed uniforme utilisé par toutes les commandes de modération (mute, ban, kick, etc.).
-    Si le serveur est Premium, l'embed passe en doré avec un badge ✨.
-    Si l'action a été faite par un Owner du bot, un badge 👑 apparaît en pied de page."""
     premium = guild is not None and is_premium(guild.id)
     if premium:
         color = get_premium_color(guild.id)
@@ -184,17 +160,11 @@ def build_mod_embed(emoji: str, title: str, color: discord.Color, cible, moderat
     return embed
 
 
-# --- Logs de modération (Premium) ---
-# mod_logs_store : {guild_id: channel_id}
-# Si un serveur Premium a configuré un salon de logs, toute action de modération
-# (mute, ban, kick, warn, clear, lock, unlock, rôle, pseudo...) y est postée automatiquement.
 mod_logs_store = db.load_mod_logs_config()
 print(f"[DB] {len(mod_logs_store)} config(s) de logs de modération chargée(s) depuis la base.")
 
 
 async def send_mod_log(guild: discord.Guild, embed: discord.Embed):
-    """Envoie une copie de l'embed d'action dans le salon de logs configuré, si le
-    serveur est Premium et a un salon de logs actif. Échoue silencieusement sinon."""
     if guild is None or not is_premium(guild.id):
         return
 
@@ -224,23 +194,23 @@ async def ping(interaction: discord.Interaction):
     embed.add_field(name="Latence", value=f"{latence_ms} ms", inline=True)
     embed.set_footer(text=f"Demandé par {interaction.user}", icon_url=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
-    @bot.tree.command(name="ia", description="Pose une question à l'IA et obtiens une réponse")
+
+
+@bot.tree.command(name="ia", description="Pose une question à l'IA et obtiens une réponse")
 @app_commands.describe(question="Ta question pour l'IA")
 async def ia(interaction: discord.Interaction, question: str):
-    await interaction.response.defer()  # l'IA peut mettre quelques secondes à répondre
+    await interaction.response.defer()
 
     try:
-        reponse = ia_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=800,
-            messages=[{"role": "user", "content": question}],
+        reponse = ia_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=question,
         )
-        texte_reponse = reponse.content[0].text
+        texte_reponse = reponse.text
     except Exception as e:
         await interaction.followup.send(f"Erreur lors de la génération de la réponse : {e}")
         return
 
-    # Discord limite un embed à 4096 caractères, on coupe si besoin
     if len(texte_reponse) > 4000:
         texte_reponse = texte_reponse[:4000] + "…"
 
@@ -274,6 +244,7 @@ async def help_cmd(interaction: discord.Interaction):
         value=(
             "`/ping` — Vérifie que le bot répond\n"
             "`/help` — Affiche ce message\n"
+            "`/ia` — Pose une question à l'IA\n"
             "`/info` — Infos détaillées sur un membre\n"
             "`/avatar` — Affiche l'avatar d'un membre\n"
             "`/servericon` — Affiche l'icône du serveur\n"
@@ -436,8 +407,6 @@ async def info(interaction: discord.Interaction, utilisateur: discord.Member = N
 
 
 def parse_duration(duration_str: str):
-    """Convertit un texte comme '10m', '10min', '1h', '1j' en secondes.
-    Retourne None si le format n'est pas reconnu."""
     duration_str = duration_str.strip().lower()
 
     units = {
@@ -447,7 +416,6 @@ def parse_duration(duration_str: str):
         "j": 86400, "d": 86400, "day": 86400, "days": 86400, "jour": 86400, "jours": 86400,
     }
 
-    # Sépare le nombre du texte, ex: "10min" -> "10" et "min"
     number = ""
     unit = ""
     for char in duration_str:
@@ -463,7 +431,6 @@ def parse_duration(duration_str: str):
 
 
 def format_duration(seconds: int) -> str:
-    """Convertit un nombre de secondes en texte lisible, ex: 600 -> '10 minutes'."""
     units = [
         (86400, "jour", "jours"),
         (3600, "heure", "heures"),
@@ -477,7 +444,6 @@ def format_duration(seconds: int) -> str:
             label = singular if value == 1 else plural
             return f"{value} {label}"
 
-    # Cas où la durée ne tombe pas rond sur une seule unité (ex: 90s = 1min30)
     return f"{seconds} secondes"
 
 
@@ -546,13 +512,11 @@ async def mute(interaction: discord.Interaction, utilisateur: discord.Member, du
     await interaction.response.send_message(embed=embed)
     await send_mod_log(interaction.guild, embed)
 
-    # Tentative d'envoi d'un MP à la personne mutée
     try:
         await utilisateur.send(
             f"Tu as été mute par {interaction.user.mention} pour {duree_lisible}. Raison : {raison}"
         )
     except discord.Forbidden:
-        # La personne a désactivé les MP, on ignore silencieusement
         pass
 
 
@@ -597,20 +561,14 @@ async def mute_demute_error(interaction: discord.Interaction, error):
         )
 
 
-# Stockage des avertissements : {user_id: [ {id, moderator, reason, timestamp}, ... ]}
-# Chargé depuis la base SQLite au démarrage, et écrit dans la base à chaque changement.
 warnings_store = db.load_warnings()
 print(f"[DB] {len(warnings_store)} membre(s) avec des avertissements chargé(s) depuis la base.")
 
-# --- Sanctions automatiques (Premium) ---
-# auto_sanctions_store : {guild_id: {seuil_int: "action"}}, ex: {3: "mute:10m", 5: "kick", 7: "ban"}
 auto_sanctions_store = db.load_auto_sanctions_config()
 print(f"[DB] {len(auto_sanctions_store)} config(s) de sanctions automatiques chargée(s) depuis la base.")
 
 
 def parse_sanction_action(texte: str):
-    """Valide une action de sanction : 'mute:10m', 'kick' ou 'ban'.
-    Retourne (type, secondes_ou_None) ou None si invalide."""
     texte = texte.strip().lower()
     if texte == "kick":
         return ("kick", None)
@@ -625,7 +583,6 @@ def parse_sanction_action(texte: str):
 
 
 def build_sanction_embed(emoji: str, title: str, color: discord.Color, cible, raison: str, guild: discord.Guild) -> discord.Embed:
-    """Embed pour une sanction déclenchée automatiquement (pas de modérateur humain)."""
     premium = guild is not None and is_premium(guild.id)
     if premium:
         color = get_premium_color(guild.id)
@@ -648,8 +605,6 @@ def build_sanction_embed(emoji: str, title: str, color: discord.Color, cible, ra
 
 
 async def check_auto_sanctions(guild: discord.Guild, utilisateur: discord.Member, total_warnings: int):
-    """Après un /warn, vérifie si le nombre total d'avertissements atteint un seuil
-    configuré pour ce serveur Premium, et applique la sanction correspondante."""
     if guild is None or not is_premium(guild.id):
         return
 
@@ -682,8 +637,6 @@ async def check_auto_sanctions(guild: discord.Guild, utilisateur: discord.Member
     except discord.Forbidden:
         return
 
-    # On tente de notifier dans le salon de logs. Si aucun salon de logs n'est configuré,
-    # la sanction reste appliquée mais ne sera visible que via /warnings ou /info.
     await send_mod_log(guild, embed)
 
     try:
@@ -695,7 +648,6 @@ async def check_auto_sanctions(guild: discord.Guild, utilisateur: discord.Member
 
 
 def build_warn_notification_embed(utilisateur: discord.Member, moderateur: discord.Member, raison: str, total: int) -> discord.Embed:
-    """Embed affiché dans le salon quand quelqu'un reçoit un avertissement."""
     embed = discord.Embed(
         title="⚠️ Avertissement donné",
         description=f"{utilisateur.mention} a reçu un avertissement.",
@@ -712,7 +664,6 @@ def build_warn_notification_embed(utilisateur: discord.Member, moderateur: disco
 
 
 def build_warnings_embed(utilisateur: discord.Member, user_warnings: list) -> discord.Embed:
-    """Embed listant les avertissements d'un membre, utilisé par /warnings."""
     embed = discord.Embed(
         title=f"Avertissements de {utilisateur}",
         color=discord.Color.orange() if user_warnings else discord.Color.green(),
@@ -737,8 +688,6 @@ def build_warnings_embed(utilisateur: discord.Member, user_warnings: list) -> di
 
 
 class WarningDeleteSelect(discord.ui.Select):
-    """Menu déroulant permettant de choisir quel avertissement supprimer."""
-
     def __init__(self, utilisateur: discord.Member, user_warnings: list, author_id: int):
         self.utilisateur = utilisateur
         self.author_id = author_id
@@ -793,8 +742,6 @@ class WarningDeleteSelect(discord.ui.Select):
 
 
 class WarningDeleteView(discord.ui.View):
-    """Vue contenant le menu de suppression d'avertissements."""
-
     def __init__(self, utilisateur: discord.Member, user_warnings: list, author_id: int):
         super().__init__(timeout=120)
         if user_warnings:
@@ -923,7 +870,6 @@ async def warn(interaction: discord.Interaction, utilisateur: discord.Member, ra
     except discord.Forbidden:
         pass
 
-    # Vérifie si ce nombre d'avertissements déclenche une sanction automatique (Premium)
     await check_auto_sanctions(interaction.guild, utilisateur, len(user_warnings))
 
 
@@ -970,8 +916,6 @@ async def moderation_error(interaction: discord.Interaction, error):
 
 
 def build_action_embed(emoji: str, title: str, color: discord.Color, description: str, guild: discord.Guild = None, extra_fields: list = None, owner_badge: bool = False) -> discord.Embed:
-    """Embed uniforme pour les actions qui ne ciblent pas un membre précis
-    (verrouillage de salon, mode lent, purge de messages, etc.)."""
     premium = guild is not None and is_premium(guild.id)
     if premium:
         color = get_premium_color(guild.id)
@@ -995,8 +939,6 @@ def build_action_embed(emoji: str, title: str, color: discord.Color, description
         embed.set_footer(text=" — ".join(footer_parts))
     return embed
 
-
-# --- Commandes utilitaires ---
 
 @bot.tree.command(name="clear", description="Supprime plusieurs messages d'un coup dans le salon")
 @app_commands.describe(
@@ -1188,7 +1130,6 @@ async def serverinfo(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-# --- Gestion des rôles ---
 role_group = app_commands.Group(name="role", description="Gestion des rôles des membres")
 bot.tree.add_command(role_group)
 
@@ -1293,7 +1234,6 @@ async def sondage(interaction: discord.Interaction, question: str, options: str 
         await message.add_reaction(e)
 
 
-# Couleurs prédéfinies proposées pour /premium couleur : (nom affiché, code hex, emoji)
 PRESET_COLORS = [
     ("Rose", "FF69B4", "🩷"),
     ("Rouge", "E74C3C", "🔴"),
@@ -1311,8 +1251,6 @@ PRESET_COLORS = [
 
 
 class PremiumColorSelect(discord.ui.Select):
-    """Menu déroulant listant les couleurs prédéfinies pour /premium couleur."""
-
     def __init__(self, guild_id: int, author_id: int):
         self.guild_id = guild_id
         self.author_id = author_id
@@ -1353,14 +1291,11 @@ class PremiumColorSelect(discord.ui.Select):
 
 
 class PremiumColorView(discord.ui.View):
-    """Vue contenant le menu de sélection de couleur prédéfinie."""
-
     def __init__(self, guild_id: int, author_id: int):
         super().__init__(timeout=120)
         self.add_item(PremiumColorSelect(guild_id, author_id))
 
 
-# --- Commandes Premium ---
 premium_group = app_commands.Group(name="premium", description="Gestion du service Premium du bot")
 bot.tree.add_command(premium_group)
 
@@ -1368,8 +1303,6 @@ bot.tree.add_command(premium_group)
 @premium_group.command(name="generer", description="[Propriétaire uniquement] Génère un code Premium et l'envoie en MP")
 @app_commands.describe(utilisateur="La personne à qui envoyer le code Premium")
 async def premium_generer(interaction: discord.Interaction, utilisateur: discord.User):
-    # Volontairement limité au SEUL vrai propriétaire du bot : ni les owners ajoutés
-    # via /owner add, ni personne d'autre, ne peuvent générer de codes Premium.
     if not await is_full_owner(interaction.user):
         embed = discord.Embed(
             title="⛔ Accès refusé",
@@ -1494,7 +1427,6 @@ async def premium_couleur(interaction: discord.Interaction, couleur: str = None)
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    # Aucun code hex fourni : on propose le menu de couleurs prédéfinies
     if couleur is None:
         embed = discord.Embed(
             title="🎨 Choisis une couleur",
@@ -1505,7 +1437,6 @@ async def premium_couleur(interaction: discord.Interaction, couleur: str = None)
             ),
             color=get_premium_color(interaction.guild.id),
         )
-        # Aperçu visuel des couleurs disponibles
         apercu = "  ".join(f"{emoji} {nom}" for nom, _, emoji in PRESET_COLORS)
         embed.add_field(name="Couleurs disponibles", value=apercu, inline=False)
         view = PremiumColorView(interaction.guild.id, interaction.user.id)
@@ -1680,8 +1611,6 @@ async def bienvenue(interaction: discord.Interaction, salon: discord.TextChannel
         await interaction.response.send_message("🔕 Message de bienvenue désactivé.", ephemeral=True)
         return
 
-    # La personnalisation du texte et l'image sont réservées au Premium.
-    # Les serveurs non-Premium peuvent quand même activer un message par défaut.
     avertissement = None
     if (message is not None or image is not None) and not premium:
         avertissement = (
@@ -1862,15 +1791,12 @@ async def premium_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# --- Bienvenue / Départ (Premium) ---
-# welcome_store : {guild_id: {welcome_channel_id, welcome_message, leave_channel_id, leave_message}}
 welcome_store = db.load_welcome_config()
 print(f"[DB] {len(welcome_store)} config(s) de bienvenue/départ chargée(s) depuis la base.")
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    # Disponible pour tous les serveurs ayant configuré /bienvenue.
     config = welcome_store.get(member.guild.id)
     if not config or not config.get("welcome_channel_id") or not config.get("welcome_message"):
         return
@@ -1897,7 +1823,6 @@ async def on_member_join(member: discord.Member):
     )
     embed.set_thumbnail(url=member.display_avatar.url)
 
-    # L'image/bannière personnalisée n'est disponible que sur les serveurs Premium.
     image_url = config.get("welcome_image_url")
     if premium and image_url:
         embed.set_image(url=image_url)
@@ -1915,7 +1840,6 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    # Disponible pour tous les serveurs ayant configuré /depart.
     config = welcome_store.get(member.guild.id)
     if not config or not config.get("leave_channel_id") or not config.get("leave_message"):
         return
@@ -1957,12 +1881,7 @@ async def on_member_remove(member: discord.Member):
         pass
 
 
-# ============================================================
-# --- Giveaways ---
-# ============================================================
-
 def build_giveaway_embed(guild: discord.Guild, giveaway: dict, ended: bool = False, winners: list = None) -> discord.Embed:
-    """Construit l'embed affiché pour un giveaway, actif ou terminé."""
     premium = is_premium(guild.id)
 
     if ended:
@@ -2019,7 +1938,6 @@ def build_giveaway_embed(guild: discord.Guild, giveaway: dict, ended: bool = Fal
 
 
 async def refresh_giveaway_message(guild: discord.Guild, giveaway: dict):
-    """Met à jour l'embed du giveaway (ex: nouveau compteur de participants)."""
     if guild is None or giveaway.get("message_id") is None:
         return
     channel = guild.get_channel(giveaway["channel_id"])
@@ -2033,8 +1951,6 @@ async def refresh_giveaway_message(guild: discord.Guild, giveaway: dict):
 
 
 async def end_giveaway(guild: discord.Guild, giveaway: dict, reroll: bool = False) -> list:
-    """Tire les gagnants, met à jour la base, édite le message et annonce les gagnants.
-    Retourne la liste des user_id gagnants (peut être vide)."""
     entries = db.get_giveaway_entries(giveaway["id"])
     nb_winners = min(giveaway["winners_count"], len(entries))
     winners = random.sample(entries, nb_winners) if nb_winners > 0 else []
@@ -2069,9 +1985,6 @@ async def end_giveaway(guild: discord.Guild, giveaway: dict, reroll: bool = Fals
 
 
 class GiveawayView(discord.ui.View):
-    """Vue persistante attachée au message d'un giveaway. Le custom_id du bouton
-    inclut l'id du giveaway pour que le bouton reste fonctionnel après un redémarrage."""
-
     def __init__(self, giveaway_id: int):
         super().__init__(timeout=None)
         self.giveaway_id = giveaway_id
@@ -2115,7 +2028,6 @@ class GiveawayView(discord.ui.View):
 
 @tasks.loop(seconds=20)
 async def check_giveaways_task():
-    """Vérifie régulièrement si des giveaways actifs sont arrivés à échéance et les termine."""
     now = datetime.datetime.now()
     for giveaway in db.load_active_giveaways():
         if giveaway["end_time"] <= now:
@@ -2359,9 +2271,6 @@ async def giveaway_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(f"Une erreur est survenue : {error}", ephemeral=True)
 
 
-# --- Commandes Owner ---
-# Réservées au SEUL vrai propriétaire du bot : lui seul peut ajouter, retirer ou lister
-# les owners. Un owner ajouté ne peut pas gérer d'autres owners, ni générer de Premium.
 owner_group = app_commands.Group(name="owner", description="Gestion des owners du bot (propriétaire uniquement)")
 bot.tree.add_command(owner_group)
 
@@ -2489,7 +2398,6 @@ async def owner_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# Le token est lu depuis une variable d'environnement, jamais écrit ici en dur
 token = os.environ.get("DISCORD_TOKEN")
 
 if token is None:
