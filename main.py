@@ -203,7 +203,7 @@ async def ia(interaction: discord.Interaction, question: str):
 
     try:
         reponse = ia_client.models.generate_content(
-            model="gemini-3-flash",
+            model="gemini-3.7-flash",
             contents=question,
         )
         texte_reponse = reponse.text
