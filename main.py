@@ -20,6 +20,7 @@ intents.message_content = True
 intents.members = True  # nécessaire pour on_member_join / on_member_remove (bienvenue-départ)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+ia_client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 @bot.event
 async def on_ready():
